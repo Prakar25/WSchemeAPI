@@ -11,10 +11,17 @@ router.get("/", async (req, res) => {
 
     // Transform to include scheme_id (which is _id)
     const transformedSchemes = schemes.map((scheme) => {
+      // Get _id from the document before converting to object
+      const schemeId = scheme._id ? scheme._id.toString() : null;
       const schemeObj = scheme.toObject();
-      schemeObj.scheme_id = schemeObj._id;
+
+      // Set scheme_id from the _id we captured
+      schemeObj.scheme_id = schemeId;
+
+      // Remove _id and __v if they still exist
       delete schemeObj._id;
       delete schemeObj.__v;
+
       return schemeObj;
     });
 
@@ -173,6 +180,62 @@ router.post("/deleteImage", async (req, res) => {
     }
     res.status(500).json({
       error: "Failed to delete image",
+      message: error.message,
+    });
+  }
+});
+
+// POST /api/schemes/delete - Delete a scheme by scheme_id from body
+router.post("/delete", async (req, res) => {
+  try {
+    const { scheme_id } = req.body;
+
+    if (!scheme_id) {
+      return res.status(400).json({
+        error: "Scheme ID is required",
+      });
+    }
+
+    // Find the scheme
+    const scheme = await Scheme.findById(scheme_id);
+
+    if (!scheme) {
+      return res.status(404).json({
+        error: "Scheme not found",
+      });
+    }
+
+    // Delete associated image file if it exists
+    if (scheme.scheme_image_file_url) {
+      const imagePath = scheme.scheme_image_file_url;
+      const relativePath = imagePath.startsWith("public")
+        ? imagePath.substring(7)
+        : imagePath.startsWith("/")
+        ? imagePath.substring(1)
+        : imagePath;
+
+      const fullFilePath = path.join(__dirname, "..", "public", relativePath);
+
+      if (fs.existsSync(fullFilePath)) {
+        fs.unlinkSync(fullFilePath);
+      }
+    }
+
+    // Delete the scheme
+    await Scheme.findByIdAndDelete(scheme_id);
+
+    res.status(200).json({
+      message: "Scheme deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting scheme:", error);
+    if (error.name === "CastError") {
+      return res.status(400).json({
+        error: "Invalid scheme ID",
+      });
+    }
+    res.status(500).json({
+      error: "Failed to delete scheme",
       message: error.message,
     });
   }

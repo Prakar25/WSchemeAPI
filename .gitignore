@@ -29,3 +29,6 @@ Thumbs.db
 # Build files
 dist/
 build/
+
+# Uploaded files
+public/uploads/admin-uploads/

@@ -8,24 +8,7 @@ const fs = require("fs");
 router.get("/", async (req, res) => {
   try {
     const schemes = await Scheme.find().sort({ createdAt: -1 });
-
-    // Transform to include scheme_id (which is _id)
-    const transformedSchemes = schemes.map((scheme) => {
-      // Get _id from the document before converting to object
-      const schemeId = scheme._id ? scheme._id.toString() : null;
-      const schemeObj = scheme.toObject();
-
-      // Set scheme_id from the _id we captured
-      schemeObj.scheme_id = schemeId;
-
-      // Remove _id and __v if they still exist
-      delete schemeObj._id;
-      delete schemeObj.__v;
-
-      return schemeObj;
-    });
-
-    res.status(200).json(transformedSchemes);
+    res.status(200).json(schemes);
   } catch (error) {
     console.error("Error fetching schemes:", error);
     res.status(500).json({
@@ -43,13 +26,7 @@ router.post("/", async (req, res) => {
     // Create new scheme
     const scheme = await Scheme.create(schemeData);
 
-    // Transform response to include scheme_id
-    const schemeObj = scheme.toObject();
-    schemeObj.scheme_id = schemeObj._id;
-    delete schemeObj._id;
-    delete schemeObj.__v;
-
-    res.status(200).json(schemeObj);
+    res.status(200).json(scheme);
   } catch (error) {
     console.error("Error creating scheme:", error);
     if (error.name === "ValidationError") {
@@ -69,16 +46,16 @@ router.post("/", async (req, res) => {
 // POST /api/schemes/update - Update a scheme
 router.post("/update", async (req, res) => {
   try {
-    const { scheme_id, ...updateData } = req.body;
+    const { _id, ...updateData } = req.body;
 
-    if (!scheme_id) {
+    if (!_id) {
       return res.status(400).json({
         error: "Scheme ID is required",
       });
     }
 
     // Find and update the scheme
-    const scheme = await Scheme.findByIdAndUpdate(scheme_id, updateData, {
+    const scheme = await Scheme.findByIdAndUpdate(_id, updateData, {
       new: true,
       runValidators: true,
     });
@@ -89,13 +66,7 @@ router.post("/update", async (req, res) => {
       });
     }
 
-    // Transform response to include scheme_id
-    const schemeObj = scheme.toObject();
-    schemeObj.scheme_id = schemeObj._id;
-    delete schemeObj._id;
-    delete schemeObj.__v;
-
-    res.status(200).json(schemeObj);
+    res.status(200).json(scheme);
   } catch (error) {
     console.error("Error updating scheme:", error);
     if (error.name === "CastError") {
@@ -120,16 +91,16 @@ router.post("/update", async (req, res) => {
 // POST /api/schemes/deleteImage - Delete image from a scheme
 router.post("/deleteImage", async (req, res) => {
   try {
-    const { scheme_id } = req.body;
+    const { _id } = req.body;
 
-    if (!scheme_id) {
+    if (!_id) {
       return res.status(400).json({
         error: "Scheme ID is required",
       });
     }
 
     // Find the scheme
-    const scheme = await Scheme.findById(scheme_id);
+    const scheme = await Scheme.findById(_id);
 
     if (!scheme) {
       return res.status(404).json({
@@ -161,15 +132,9 @@ router.post("/deleteImage", async (req, res) => {
     scheme.scheme_image_file_url = null;
     await scheme.save();
 
-    // Transform response
-    const schemeObj = scheme.toObject();
-    schemeObj.scheme_id = schemeObj._id;
-    delete schemeObj._id;
-    delete schemeObj.__v;
-
     res.status(200).json({
       message: "Image deleted successfully",
-      data: schemeObj,
+      data: scheme,
     });
   } catch (error) {
     console.error("Error deleting scheme image:", error);
@@ -185,19 +150,19 @@ router.post("/deleteImage", async (req, res) => {
   }
 });
 
-// POST /api/schemes/delete - Delete a scheme by scheme_id from body
+// POST /api/schemes/delete - Delete a scheme by _id from body
 router.post("/delete", async (req, res) => {
   try {
-    const { scheme_id } = req.body;
+    const { _id } = req.body;
 
-    if (!scheme_id) {
+    if (!_id) {
       return res.status(400).json({
         error: "Scheme ID is required",
       });
     }
 
     // Find the scheme
-    const scheme = await Scheme.findById(scheme_id);
+    const scheme = await Scheme.findById(_id);
 
     if (!scheme) {
       return res.status(404).json({
@@ -222,7 +187,7 @@ router.post("/delete", async (req, res) => {
     }
 
     // Delete the scheme
-    await Scheme.findByIdAndDelete(scheme_id);
+    await Scheme.findByIdAndDelete(_id);
 
     res.status(200).json({
       message: "Scheme deleted successfully",

@@ -26,8 +26,8 @@ const adminUserSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Index for faster queries
-adminUserSchema.index({ username: 1 });
+// Note: username index is automatically created by unique: true
+// No need to manually create it again
 
 module.exports = mongoose.model('AdminUser', adminUserSchema);
 

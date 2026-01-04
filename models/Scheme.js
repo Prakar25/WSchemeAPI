@@ -11,31 +11,19 @@ const schemeSchema = new mongoose.Schema(
       type: Date,
       required: false,
     },
-    gender_id: {
-      type: Number,
-      required: [true, "Gender ID is required"],
-    },
-    gender_name: {
+    gender: {
       type: String,
-      required: [true, "Gender name is required"],
+      required: [true, "Gender is required"],
       trim: true,
     },
-    category_id: {
-      type: Number,
-      required: [true, "Category ID is required"],
-    },
-    category_name: {
+    category: {
       type: String,
-      required: [true, "Category name is required"],
+      required: [true, "Category is required"],
       trim: true,
     },
-    sub_category_id: {
-      type: Number,
-      required: [true, "Sub-category ID is required"],
-    },
-    sub_category_name: {
+    sub_category: {
       type: String,
-      required: [true, "Sub-category name is required"],
+      required: [true, "Sub-category is required"],
       trim: true,
     },
     scheme_description: {
@@ -44,24 +32,65 @@ const schemeSchema = new mongoose.Schema(
       trim: true,
     },
     scheme_objectives: {
-      type: String,
+      type: [String],
       required: [true, "Scheme objectives is required"],
+      validate: {
+        validator: function(v) {
+          return Array.isArray(v) && v.length > 0;
+        },
+        message: "Scheme objectives must be a non-empty array"
+      }
     },
     scheme_benefits: {
-      type: String,
+      type: [String],
       required: [true, "Scheme benefits is required"],
+      validate: {
+        validator: function(v) {
+          return Array.isArray(v) && v.length > 0;
+        },
+        message: "Scheme benefits must be a non-empty array"
+      }
     },
-    scheme_eligibility_lower_age_limit: {
-      type: Number,
-      required: [true, "Lower age limit is required"],
+    scheme_eligibility: {
+      lower_age_limit: {
+        type: Number,
+        required: [true, "Lower age limit is required"],
+      },
+      upper_age_limit: {
+        type: Number,
+        required: [true, "Upper age limit is required"],
+      },
     },
-    scheme_eligibility_upper_age_limit: {
-      type: Number,
-      required: [true, "Upper age limit is required"],
+    scheme_required_document_types: {
+      type: [String],
+      required: [true, "Required document types is required"],
+      validate: {
+        validator: function(v) {
+          return Array.isArray(v) && v.length > 0;
+        },
+        message: "Required document types must be a non-empty array"
+      }
     },
     scheme_required_documents: {
-      type: String,
-      required: [true, "Required documents is required"],
+      type: [
+        {
+          document_type: {
+            type: String,
+            required: [true, "Document type is required"],
+            trim: true,
+          },
+          file_url: {
+            type: String,
+            required: [true, "File URL is required"],
+            trim: true,
+          },
+          uploaded_at: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
     },
     scheme_image_file_url: {
       type: String,
@@ -73,17 +102,12 @@ const schemeSchema = new mongoose.Schema(
     timestamps: true,
     toJSON: {
       transform: function (doc, ret) {
-        // Map _id to scheme_id for frontend compatibility
-        ret.scheme_id = ret._id;
-        delete ret._id;
         delete ret.__v;
         return ret;
       },
     },
     toObject: {
       transform: function (doc, ret) {
-        ret.scheme_id = ret._id;
-        delete ret._id;
         delete ret.__v;
         return ret;
       },
@@ -93,8 +117,8 @@ const schemeSchema = new mongoose.Schema(
 
 // Index for faster queries
 schemeSchema.index({ scheme_name: 1 });
-schemeSchema.index({ category_id: 1 });
-schemeSchema.index({ gender_id: 1 });
-schemeSchema.index({ sub_category_id: 1 });
+schemeSchema.index({ category: 1 });
+schemeSchema.index({ gender: 1 });
+schemeSchema.index({ sub_category: 1 });
 
 module.exports = mongoose.model("Scheme", schemeSchema);

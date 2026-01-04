@@ -199,7 +199,8 @@ const publicUserSchema = new mongoose.Schema(
 );
 
 // Index for faster queries
-publicUserSchema.index({ aadhaarNumber: 1 });
+// Note: aadhaarNumber index is automatically created by unique: true
+// No need to manually create it again
 publicUserSchema.index({ "contact.email.value": 1 });
 publicUserSchema.index({ "contact.mobile.value": 1 });
 publicUserSchema.index({ "demographics.fullName": 1 });

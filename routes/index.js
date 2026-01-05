@@ -22,4 +22,7 @@ router.use("/public-users", require("./publicUsers"));
 // Admin user login routes
 router.use("/admin-login", require("./adminUsers"));
 
+// Profile routes
+router.use("/profile", require("./profile"));
+
 module.exports = router;

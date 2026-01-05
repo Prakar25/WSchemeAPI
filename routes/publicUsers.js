@@ -29,6 +29,8 @@ const handleLookup = async (req, res) => {
     }
 
     const responseUser = {
+      _id: user._id || null,
+      userId: user._id || null, // Alias for convenience
       fullName: user.demographics?.fullName || null,
       contactEmail: user.contact?.email?.value || null,
       phoneNumber: user.contact?.mobile?.value || null,

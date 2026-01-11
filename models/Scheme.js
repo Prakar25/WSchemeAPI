@@ -26,6 +26,11 @@ const schemeSchema = new mongoose.Schema(
       required: [true, "Sub-category is required"],
       trim: true,
     },
+    department: {
+      type: String,
+      required: [true, "Department is required"],
+      trim: true,
+    },
     scheme_description: {
       type: String,
       required: [true, "Scheme description is required"],
@@ -97,6 +102,15 @@ const schemeSchema = new mongoose.Schema(
       required: false,
       default: null,
     },
+    excluded_schemes: {
+      type: [
+        {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Scheme",
+        },
+      ],
+      default: [],
+    },
   },
   {
     timestamps: true,
@@ -115,10 +129,22 @@ const schemeSchema = new mongoose.Schema(
   }
 );
 
+// Pre-save hook to prevent self-exclusion
+schemeSchema.pre('save', function(next) {
+  if (this.excluded_schemes && this.excluded_schemes.length > 0) {
+    // Remove self from excluded_schemes if present
+    this.excluded_schemes = this.excluded_schemes.filter(
+      schemeId => !schemeId.equals(this._id)
+    );
+  }
+  next();
+});
+
 // Index for faster queries
 schemeSchema.index({ scheme_name: 1 });
 schemeSchema.index({ category: 1 });
 schemeSchema.index({ gender: 1 });
 schemeSchema.index({ sub_category: 1 });
+schemeSchema.index({ department: 1 });
 
 module.exports = mongoose.model("Scheme", schemeSchema);

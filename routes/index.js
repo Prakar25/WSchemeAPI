@@ -25,4 +25,13 @@ router.use("/admin-login", require("./adminUsers"));
 // Profile routes
 router.use("/profile", require("./profile"));
 
+// Admin dashboard routes
+router.use("/admin/dashboard", require("./adminDashboard"));
+
+// Admin profile routes
+router.use("/admin/profile", require("./adminProfile"));
+
+// Application routes
+router.use("/applications", require("./applications"));
+
 module.exports = router;

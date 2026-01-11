@@ -1,13 +1,46 @@
 const express = require("express");
 const router = express.Router();
 const Scheme = require("../models/Scheme");
+const Application = require("../models/Application");
+const PublicUser = require("../models/PublicUser");
+const { checkEligibility, hasAppliedToExcludedSchemes } = require("../utils/eligibilityUtils");
 const path = require("path");
 const fs = require("fs");
 
 // GET /api/schemes - Get all schemes
+// Optional query params: user_id (to filter based on excluded schemes)
 router.get("/", async (req, res) => {
   try {
-    const schemes = await Scheme.find().sort({ createdAt: -1 });
+    const { user_id } = req.query;
+    let schemes = await Scheme.find().sort({ createdAt: -1 });
+
+    // If user_id is provided, filter out schemes where user has applied to excluded schemes
+    if (user_id) {
+      const user = await PublicUser.findById(user_id);
+      if (user) {
+        const filteredSchemes = [];
+        
+        for (const scheme of schemes) {
+          // Check if user has applied to any excluded schemes
+          if (scheme.excluded_schemes && scheme.excluded_schemes.length > 0) {
+            const excludedCheck = await hasAppliedToExcludedSchemes(
+              user_id, 
+              scheme.excluded_schemes
+            );
+            
+            // If user has applied to excluded schemes, skip this scheme
+            if (excludedCheck.hasApplied) {
+              continue;
+            }
+          }
+          
+          filteredSchemes.push(scheme);
+        }
+        
+        schemes = filteredSchemes;
+      }
+    }
+
     res.status(200).json(schemes);
   } catch (error) {
     console.error("Error fetching schemes:", error);

@@ -49,6 +49,7 @@ router.post("/", async (req, res) => {
         role: user.role,
         roleLevel: roleLevel,
         department: user.department || null,
+        departmentId: user.departmentId || null,
       },
     });
   } catch (error) {

@@ -1,0 +1,40 @@
+{
+  "admin": {
+    "_id": {
+      "$oid": "6963777ad222d34918411f8a"
+        },
+        "fullName": "Admin User",
+        "username": "admin.user",
+        "contactNumber": "9000000000",
+        "password": "Admin@123",
+        "department": null,
+        "departmentId": null,
+        "role": "Admin",
+        "isActive": true,
+        "createdAt": {
+        "$date": "2026-01-11T10:12:10.356Z"
+        },
+        "updatedAt": {
+        "$date": "2026-01-11T10:12:10.356Z"
+        }
+  },
+  "superAdmin": {
+    "_id": {
+      "$oid": "6963777ad222d34918411f9a"
+    },
+    "fullName": "Super Admin User",
+    "username": "super.admin",
+    "contactNumber": "9000000001",
+    "password": "Admin@123",
+    "department": null,
+    "departmentId": null,
+    "role": "Super Admin",
+    "isActive": true,
+    "createdAt": {
+      "$date": "2026-01-11T10:12:10.356Z"
+    },
+    "updatedAt": {
+      "$date": "2026-01-11T10:12:10.356Z"
+    }
+  }
+}

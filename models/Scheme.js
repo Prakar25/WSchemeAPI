@@ -21,11 +21,6 @@ const schemeSchema = new mongoose.Schema(
       required: [true, "Category is required"],
       trim: true,
     },
-    sub_category: {
-      type: String,
-      required: [true, "Sub-category is required"],
-      trim: true,
-    },
     department: {
       type: String,
       required: [true, "Department is required"],
@@ -111,6 +106,68 @@ const schemeSchema = new mongoose.Schema(
       ],
       default: [],
     },
+    // Authorization levels for the scheme (in order of authorization flow)
+    // Based on ADMIN_ROLES_ENUM.md: 8=Super Admin, 7=Admin, 6=Department Secretary, 
+    // 5=Department Head, 4=Department User, 3=DistrictHQ Head, 2=District Overlookers, 1=Post Operator
+    authorization_levels: {
+      type: [Number],
+      required: false,
+      default: [],
+      validate: {
+        validator: function(v) {
+          // Must be an array of numbers between 1-8
+          return Array.isArray(v) && v.every(level => Number.isInteger(level) && level >= 1 && level <= 8);
+        },
+        message: "Authorization levels must be an array of integers between 1 and 8"
+      }
+    },
+    // Approval status for scheme creation
+    approval_status: {
+      type: String,
+      enum: ["pending_department_head_approval", "approved", "rejected"],
+      default: "pending_department_head_approval",
+      required: true,
+    },
+    // Creator information
+    created_by: {
+      admin_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "AdminUser",
+        required: false,
+      },
+      admin_username: {
+        type: String,
+        required: false,
+      },
+      admin_role: {
+        type: String,
+        required: false,
+      },
+      created_at: {
+        type: Date,
+        default: Date.now,
+      },
+    },
+    // Department Head approval information
+    department_head_approval: {
+      approved_by: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "AdminUser",
+        required: false,
+      },
+      approved_by_username: {
+        type: String,
+        required: false,
+      },
+      approved_at: {
+        type: Date,
+        required: false,
+      },
+      rejection_reason: {
+        type: String,
+        required: false,
+      },
+    },
   },
   {
     timestamps: true,
@@ -130,21 +187,27 @@ const schemeSchema = new mongoose.Schema(
 );
 
 // Pre-save hook to prevent self-exclusion
-schemeSchema.pre('save', function(next) {
-  if (this.excluded_schemes && this.excluded_schemes.length > 0) {
+schemeSchema.pre('save', async function() {
+  if (this.excluded_schemes && this.excluded_schemes.length > 0 && this._id) {
     // Remove self from excluded_schemes if present
+    // excluded_schemes are ObjectId strings, so compare as strings
+    const currentId = this._id.toString();
     this.excluded_schemes = this.excluded_schemes.filter(
-      schemeId => !schemeId.equals(this._id)
+      schemeId => {
+        // Handle both ObjectId objects and strings
+        const schemeIdStr = schemeId.toString ? schemeId.toString() : String(schemeId);
+        return schemeIdStr !== currentId;
+      }
     );
   }
-  next();
 });
 
 // Index for faster queries
 schemeSchema.index({ scheme_name: 1 });
 schemeSchema.index({ category: 1 });
 schemeSchema.index({ gender: 1 });
-schemeSchema.index({ sub_category: 1 });
 schemeSchema.index({ department: 1 });
+schemeSchema.index({ approval_status: 1 });
+schemeSchema.index({ "created_by.admin_id": 1 });
 
 module.exports = mongoose.model("Scheme", schemeSchema);

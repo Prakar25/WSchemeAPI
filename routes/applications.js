@@ -61,20 +61,47 @@ router.post("/apply", async (req, res) => {
       });
     }
 
-    // Create application - starts at Level 7 or 8 (Post Operator) for initial verification
+    // Get authorization levels from scheme (workflow sequence)
+    const authorizationLevels = scheme.authorization_levels || [];
+    
+    // Determine initial verification level
+    // If authorization_levels exist, start with the first level
+    // Otherwise, use default workflow (start at Post Operator level 7/8)
+    let initialVerificationLevel = 7; // Default: Post Operator
+    let authorizationLevelIndex = 0;
+    
+    if (authorizationLevels.length > 0) {
+      // Start at the first authorization level
+      initialVerificationLevel = authorizationLevels[0];
+      authorizationLevelIndex = 0;
+    }
+
+    // Create application - starts at first authorization level or default
+    // Get ApplicationModel helper functions (getStageNameFromLevel is exported from the model)
+    const ApplicationModel = require("../models/Application");
+    
     const application = await Application.create({
       user_id,
       scheme_id,
       status: "Applied",
-      verification_level: 7, // Start at Level 7 (Post Operator) - first verification step
-      verification_stage: "Post_Operator_Review", // Legacy field
+      verification_level: initialVerificationLevel,
+      verification_stage: ApplicationModel.getStageNameFromLevel(initialVerificationLevel), // Legacy field
+      authorization_levels: authorizationLevels, // Store the workflow sequence
+      authorization_level_index: authorizationLevelIndex, // Start at first level
       form_data: form_data || {},
       documents_submitted: documents_submitted || [],
     });
 
     const populatedApplication = await Application.findById(application._id)
       .populate("user_id", "demographics.fullName")
-      .populate("scheme_id", "scheme_name scheme_type category department");
+      .populate({
+        path: "scheme_id",
+        select: "scheme_name scheme_type category department",
+        populate: [
+          { path: "category", select: "category_name category_display_name" },
+          { path: "department", select: "department_name department_display_name" }
+        ]
+      });
 
     res.status(201).json({
       status: "success",
@@ -100,10 +127,14 @@ router.post("/apply", async (req, res) => {
 });
 
 // GET /api/applications - Get applications (with filters)
+// All admins can VIEW applications, but department filtering applies:
+// - Secretary (level 3) and above (Admin level 2, Super Admin level 1) can view ALL departments
+// - Below Secretary (level > 3) can only view their own department
 router.get("/", adminAuth, async (req, res) => {
   try {
     const { user_id, scheme_id, status, verification_stage, assigned_to_me } = req.query;
     const adminRoleLevel = req.admin.roleLevel;
+    const adminDepartmentId = req.admin.departmentId;
 
     const query = {};
 
@@ -128,38 +159,37 @@ router.get("/", adminAuth, async (req, res) => {
       query["current_verifier.verified_by"] = req.admin._id;
     }
 
-    // Filter by verification level based on role level
-    if (!verification_stage && !assigned_to_me) {
-      // Level 7 & 8 (District Overlookers/Post Operator) - see Level 7 or 8 (FIRST)
-      if (adminRoleLevel === 7 || adminRoleLevel === 8) {
-        query.$or = [{ verification_level: 7 }, { verification_level: 8 }];
-      }
-      // Level 1 & 2 (Super Admin/Admin) - see Level 1 or 2
-      else if (adminRoleLevel === 1 || adminRoleLevel === 2) {
-        query.$or = [{ verification_level: 1 }, { verification_level: 2 }];
-      }
-      // Level 6 (DistrictHQ Head) - see Level 6
-      else if (adminRoleLevel === 6) {
-        query.verification_level = 6;
-      }
-      // Level 4 & 5 (Department Head/User) - see Level 4 or 5
-      else if (adminRoleLevel === 4 || adminRoleLevel === 5) {
-        query.$or = [{ verification_level: 4 }, { verification_level: 5 }];
-      }
-      // Level 3 (Department Secretary) - see Level 3
-      else if (adminRoleLevel === 3) {
-        query.verification_level = 3;
-      }
-    }
+    // NOTE: Removed verification level filtering - all admins can VIEW applications
+    // Verification/acceptance restrictions are still enforced in the verify endpoint
 
+    // Fetch all applications (no verification level filter for viewing)
     const applications = await Application.find(query)
       .populate("user_id", "demographics.fullName demographics.gender demographics.dob aadhaarNumber contact")
-      .populate("scheme_id", "scheme_name scheme_type category department")
+      .populate({
+        path: "scheme_id",
+        select: "scheme_name scheme_type category department",
+      })
       .populate("current_verifier.verified_by", "fullName username role")
       .sort({ createdAt: -1 });
     
+    // Apply department filtering after population
+    // Secretary (level 3) and above can see all departments
+    // Below Secretary (level > 3) can only see their own department
+    let filteredApplications = applications;
+    if (adminRoleLevel > 3 && adminDepartmentId) {
+      // Filter by department for roles below Secretary
+      // Compare department IDs (ObjectId strings) - direct string comparison
+      filteredApplications = applications.filter(app => {
+        const schemeDept = app.scheme_id?.department;
+        if (!schemeDept) return false;
+        // Direct string comparison (ObjectId strings are case-sensitive)
+        return schemeDept.trim() === adminDepartmentId.trim();
+      });
+    }
+    // If roleLevel <= 3 (Secretary, Admin, Super Admin), show all applications (no filtering)
+    
     // Transform to include applicant name and verification info
-    const transformedApplications = applications.map(app => {
+    const transformedApplications = filteredApplications.map(app => {
       const appObj = app.toObject();
       return {
         ...appObj,
@@ -172,14 +202,95 @@ router.get("/", adminAuth, async (req, res) => {
 
     res.status(200).json({
       status: "success",
-      data: applications,
-      count: applications.length,
+      data: transformedApplications,
+      count: transformedApplications.length,
     });
   } catch (error) {
     console.error("Error fetching applications:", error);
     res.status(500).json({
       status: "error",
       message: "Failed to fetch applications",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+});
+
+// GET /api/applications/scheme/:scheme_id - Get all applicants for a specific scheme
+router.get("/scheme/:scheme_id", async (req, res) => {
+  try {
+    const { scheme_id } = req.params;
+
+    // Check if scheme exists
+    const scheme = await Scheme.findById(scheme_id);
+    if (!scheme) {
+      return res.status(404).json({
+        status: "error",
+        message: "Scheme not found",
+      });
+    }
+
+    // Find all applications for this scheme
+    const applications = await Application.find({ scheme_id })
+      .populate("user_id", "demographics.fullName demographics.gender demographics.dob aadhaarNumber contact address")
+      .populate({
+        path: "scheme_id",
+        select: "scheme_name scheme_type category department scheme_description",
+      })
+      .populate("current_verifier.verified_by", "fullName username role")
+      .sort({ createdAt: -1 });
+
+    // Get ApplicationModel helper functions
+    const ApplicationModel = require("../models/Application");
+    
+    // Transform applications to simple table format (essential fields only)
+    const applicants = applications.map(app => {
+      const appObj = app.toObject();
+      const user = app.user_id;
+      
+      // Get verification stage from level (always derive from level for consistency)
+      let verificationStage = "";
+      if (appObj.verification_level !== undefined && appObj.verification_level !== null) {
+        verificationStage = ApplicationModel.getStageNameFromLevel(appObj.verification_level);
+      }
+      
+      return {
+        application_id: appObj._id?.toString() || "",
+        full_name: user?.demographics?.fullName || "",
+        status: appObj.status || "",
+        date_applied: appObj.date_applied || appObj.createdAt,
+        verification_stage: verificationStage,
+      };
+    });
+
+    res.status(200).json({
+      status: "success",
+      scheme: {
+        _id: scheme._id,
+        scheme_name: scheme.scheme_name,
+        category: scheme.category,
+        department: scheme.department,
+      },
+      applicants: applicants,
+      total_applicants: applicants.length,
+      count_by_status: {
+        Applied: applicants.filter(a => a.status === "Applied").length,
+        "Under Review": applicants.filter(a => a.status === "Under Review").length,
+        Approved: applicants.filter(a => a.status === "Approved").length,
+        Rejected: applicants.filter(a => a.status === "Rejected").length,
+        Pending: applicants.filter(a => a.status === "Pending").length,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching scheme applicants:", error);
+    if (error.name === "CastError") {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid scheme ID",
+      });
+    }
+    res.status(500).json({
+      status: "error",
+      message: "Failed to fetch scheme applicants",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
@@ -454,41 +565,73 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     
     const adminRoleLevel = admin.roleLevel;
 
+    // Get authorization levels from application (scheme-specific workflow)
+    const authorizationLevels = application.authorization_levels || [];
+    const authorizationLevelIndex = application.authorization_level_index || 0;
+    
+    // Check if using scheme-specific workflow or default workflow
+    const useSchemeWorkflow = authorizationLevels.length > 0;
+    
     // Get required role levels for current verification level
-    const requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
+    let requiredRoleLevels = [];
+    if (useSchemeWorkflow) {
+      // For scheme-specific workflow, check if current level matches the expected level at current index
+      if (authorizationLevelIndex < authorizationLevels.length) {
+        const expectedLevel = authorizationLevels[authorizationLevelIndex];
+        requiredRoleLevels = [expectedLevel];
+      }
+    } else {
+      // Use default workflow logic
+      requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
+    }
     
     // Check if admin can verify at this level
     const canVerify = requiredRoleLevels.includes(adminRoleLevel);
     
-    // Determine next level based on current level and action
+    // Determine next level based on workflow type and action
     let nextLevel = null;
+    let nextAuthorizationLevelIndex = authorizationLevelIndex;
     
     if (canVerify) {
       if (action === "Verified" || action === "Forwarded") {
-        // Move to next level in hierarchy
-        if (currentLevel === 7 || currentLevel === 8) {
-          nextLevel = 1; // Post Operator -> Admin
-        } else if (currentLevel === 1 || currentLevel === 2) {
-          nextLevel = 6; // Admin -> District Head
-        } else if (currentLevel === 6) {
-          nextLevel = 4; // District Head -> Department
-        } else if (currentLevel === 4 || currentLevel === 5) {
-          nextLevel = 3; // Department -> Secretary
-        } else if (currentLevel === 3) {
-          nextLevel = 99; // Secretary -> Completed
+        if (useSchemeWorkflow) {
+          // Move to next level in authorization_levels array
+          nextAuthorizationLevelIndex = authorizationLevelIndex + 1;
+          if (nextAuthorizationLevelIndex < authorizationLevels.length) {
+            nextLevel = authorizationLevels[nextAuthorizationLevelIndex];
+          } else {
+            // Reached end of authorization levels - mark as completed
+            nextLevel = 99; // Completed
+          }
+        } else {
+          // Use default workflow: 7/8 -> 6 -> 3 -> Completed
+          if (currentLevel === 7 || currentLevel === 8) {
+            nextLevel = 6; // Post Operator -> District Head
+          } else if (currentLevel === 6) {
+            nextLevel = 3; // District Head -> Secretary
+          } else if (currentLevel === 3) {
+            nextLevel = 99; // Secretary -> Completed
+          }
         }
       } else if (action === "Returned") {
-        // Return to previous level
-        if (currentLevel === 1 || currentLevel === 2) {
-          nextLevel = 7; // Admin -> Post Operator
-        } else if (currentLevel === 6) {
-          nextLevel = 1; // District Head -> Admin
-        } else if (currentLevel === 4 || currentLevel === 5) {
-          nextLevel = 6; // Department -> District Head
-        } else if (currentLevel === 3) {
-          nextLevel = 4; // Secretary -> Department
-        } else if (currentLevel === 7 || currentLevel === 8) {
-          nextLevel = currentLevel; // Stay at Post Operator (can't go back further)
+        if (useSchemeWorkflow) {
+          // Return to previous level in authorization_levels array
+          if (authorizationLevelIndex > 0) {
+            nextAuthorizationLevelIndex = authorizationLevelIndex - 1;
+            nextLevel = authorizationLevels[nextAuthorizationLevelIndex];
+          } else {
+            // Already at first level, can't go back
+            nextLevel = currentLevel;
+          }
+        } else {
+          // Use default workflow for returns: 3 -> 6 -> 7/8 -> (can't go back)
+          if (currentLevel === 3) {
+            nextLevel = 6; // Secretary -> District Head
+          } else if (currentLevel === 6) {
+            nextLevel = 7; // District Head -> Post Operator
+          } else if (currentLevel === 7 || currentLevel === 8) {
+            nextLevel = currentLevel; // Stay at Post Operator (can't go back further)
+          }
         }
       }
     }
@@ -605,10 +748,13 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
       };
     }
 
-    // Update verification level
+    // Update verification level and authorization index
     if (nextLevel !== null) {
       application.verification_level = nextLevel;
       application.verification_stage = ApplicationModel.getStageNameFromLevel(nextLevel); // Legacy field for backward compatibility
+      if (useSchemeWorkflow) {
+        application.authorization_level_index = nextAuthorizationLevelIndex;
+      }
     }
     
     // Ensure verification_level is always set
@@ -739,7 +885,14 @@ router.get("/user/:user_id/summary", async (req, res) => {
     const { user_id } = req.params;
 
     const applications = await Application.find({ user_id })
-      .populate("scheme_id", "scheme_name scheme_type category department")
+      .populate({
+        path: "scheme_id",
+        select: "scheme_name scheme_type category department",
+        populate: [
+          { path: "category", select: "category_name category_display_name" },
+          { path: "department", select: "department_name department_display_name" }
+        ]
+      })
       .select("status verification_level date_applied scheme_id createdAt updatedAt")
       .sort({ createdAt: -1 });
 

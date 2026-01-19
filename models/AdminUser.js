@@ -58,6 +58,12 @@ const adminUserSchema = new mongoose.Schema({
     trim: true,
     default: null
   },
+  departmentId: {
+    type: String,
+    required: false,
+    trim: true,
+    default: null
+  },
   isActive: {
     type: Boolean,
     default: true

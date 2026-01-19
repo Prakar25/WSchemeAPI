@@ -13,6 +13,9 @@ router.get("/health", (req, res) => {
 // Scheme routes
 router.use("/schemes", require("./schemes"));
 
+// Admin roles routes
+router.use("/admin-roles", require("./adminRoles"));
+
 // Seed routes
 router.use("/seed", require("./seed"));
 
@@ -33,5 +36,11 @@ router.use("/admin/profile", require("./adminProfile"));
 
 // Application routes
 router.use("/applications", require("./applications"));
+
+// Category routes
+router.use("/categories", require("./categories"));
+
+// Department routes
+router.use("/departments", require("./departments"));
 
 module.exports = router;

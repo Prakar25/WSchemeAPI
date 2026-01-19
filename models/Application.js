@@ -12,6 +12,18 @@ const applicationSchema = new mongoose.Schema(
       ref: "Scheme",
       required: [true, "Scheme ID is required"],
     },
+    // Authorization levels from the scheme (stores the workflow sequence)
+    authorization_levels: {
+      type: [Number],
+      required: false,
+      default: [],
+    },
+    // Current index in the authorization_levels array (tracks progress through workflow)
+    authorization_level_index: {
+      type: Number,
+      required: false,
+      default: 0,
+    },
     status: {
       type: String,
       enum: ["Applied", "Under Review", "Approved", "Rejected", "Pending"],

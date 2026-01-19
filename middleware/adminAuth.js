@@ -56,6 +56,8 @@ const adminAuth = async (req, res, next) => {
       fullName: admin.fullName,
       role: admin.role,
       roleLevel: admin.constructor.ROLE_LEVELS[admin.role] || 0,
+      department: admin.department || null,
+      departmentId: admin.departmentId || null,
     };
 
     next();

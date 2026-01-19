@@ -14,6 +14,7 @@ const formatAdminUser = (user) => {
     role: user.role,
     roleLevel: roleLevel,
     department: user.department || null,
+    departmentId: user.departmentId || null,
     isActive: user.isActive,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,

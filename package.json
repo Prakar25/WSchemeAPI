@@ -5,7 +5,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "seed:categories": "node scripts/seedCategoriesSimple.js",
+    "seed:departments": "node scripts/seedDepartments.js",
+    "migrate:schemes": "node scripts/migrateSchemesToObjectIds.js",
+    "insert:schemes": "node scripts/insertExistingSchemes.js"
   },
   "keywords": [
     "api",

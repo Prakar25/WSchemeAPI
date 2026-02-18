@@ -4,35 +4,36 @@ const publicUserSchema = new mongoose.Schema(
   {
     aadhaarNumber: {
       type: String,
-      required: [true, "Aadhaar number is required"],
+      required: false, // Optional - not required for mobile-based registration
       unique: true,
+      sparse: true, // Allow multiple null values
       trim: true,
       match: [/^\d{12}$/, "Aadhaar number must be 12 digits"],
     },
     aadhaarHash: {
       type: String,
-      required: [true, "Aadhaar hash is required"],
+      required: false, // Optional - not required for mobile-based registration
       trim: true,
     },
     demographics: {
       fullName: {
         type: String,
-        required: [true, "Full name is required"],
+        required: false, // Optional - can be added later
         trim: true,
       },
       dob: {
         date: {
           type: Date,
-          required: [true, "Date of birth is required"],
+          required: false, // Optional - can be added later
         },
         verified: {
           type: Boolean,
-          default: true,
+          default: false,
         },
       },
       gender: {
         type: String,
-        required: [true, "Gender is required"],
+        required: false, // Optional - can be added later
         enum: ["M", "F", "O"],
         uppercase: true,
       },
@@ -65,22 +66,22 @@ const publicUserSchema = new mongoose.Schema(
       },
       locality: {
         type: String,
-        required: [true, "Locality is required"],
+        required: false, // Optional - can be added later
         trim: true,
       },
       district: {
         type: String,
-        required: [true, "District is required"],
+        required: false, // Optional - can be added later
         trim: true,
       },
       state: {
         type: String,
-        required: [true, "State is required"],
+        required: false, // Optional - can be added later
         trim: true,
       },
       pincode: {
         type: String,
-        required: [true, "Pincode is required"],
+        required: false, // Optional - can be added later
         trim: true,
         match: [/^\d{6}$/, "Pincode must be 6 digits"],
       },
@@ -96,6 +97,7 @@ const publicUserSchema = new mongoose.Schema(
           type: String,
           required: [true, "Mobile number is required"],
           trim: true,
+          match: [/^[6-9]\d{9}$/, "Mobile number must be a valid 10-digit Indian number"],
         },
         verified: {
           type: Boolean,
@@ -105,7 +107,7 @@ const publicUserSchema = new mongoose.Schema(
       email: {
         value: {
           type: String,
-          required: [true, "Email is required"],
+          required: false, // Optional - not required for mobile-based registration
           trim: true,
           lowercase: true,
           match: [/^\S+@\S+\.\S+$/, "Please enter a valid email"],
@@ -148,6 +150,50 @@ const publicUserSchema = new mongoose.Schema(
         },
       },
     },
+    documents: {
+      aadhaarCard: {
+        filePath: {
+          type: String,
+          default: null,
+        },
+        uploadedAt: {
+          type: Date,
+          default: null,
+        },
+        verified: {
+          type: Boolean,
+          default: false,
+        },
+      },
+      birthCertificate: {
+        filePath: {
+          type: String,
+          default: null,
+        },
+        uploadedAt: {
+          type: Date,
+          default: null,
+        },
+        verified: {
+          type: Boolean,
+          default: false,
+        },
+      },
+      certificateOfIdentification: {
+        filePath: {
+          type: String,
+          default: null,
+        },
+        uploadedAt: {
+          type: Date,
+          default: null,
+        },
+        verified: {
+          type: Boolean,
+          default: false,
+        },
+      },
+    },
     status: {
       isActive: {
         type: Boolean,
@@ -160,6 +206,24 @@ const publicUserSchema = new mongoose.Schema(
       reason: {
         type: String,
         default: null,
+      },
+      verificationStatus: {
+        type: String,
+        enum: ["pending", "verified", "rejected"],
+        default: "pending", // Set to pending after profile completion, verified by CSDAdmin
+      },
+      verifiedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "AdminUser",
+        default: null, // CSDAdmin who verified the user
+      },
+      verifiedAt: {
+        type: Date,
+        default: null, // Timestamp when verified by CSDAdmin
+      },
+      rejectionReason: {
+        type: String,
+        default: null, // Reason if verification is rejected
       },
     },
     kycLevel: {
@@ -199,10 +263,9 @@ const publicUserSchema = new mongoose.Schema(
 );
 
 // Index for faster queries
-// Note: aadhaarNumber index is automatically created by unique: true
-// No need to manually create it again
+// Note: aadhaarNumber index is automatically created by unique: true (sparse)
 publicUserSchema.index({ "contact.email.value": 1 });
-publicUserSchema.index({ "contact.mobile.value": 1 });
+publicUserSchema.index({ "contact.mobile.value": 1 }, { unique: true }); // Mobile number must be unique for login
 publicUserSchema.index({ "demographics.fullName": 1 });
 
 module.exports = mongoose.model("PublicUser", publicUserSchema);

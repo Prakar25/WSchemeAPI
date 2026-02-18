@@ -87,6 +87,7 @@ x-admin-password: admin_password
 ## Common Request/Response Examples
 
 ### Apply to Scheme
+Only public users with **verificationStatus === "verified"** can apply. Others get **403** (can only view schemes).
 ```javascript
 POST /applications/apply
 {
@@ -97,6 +98,7 @@ POST /applications/apply
     {"document_type": "Aadhaar", "file_url": "path/to/file.pdf"}
   ]
 }
+// 403 response when not verified: { status: "error", message: "...", verificationStatus: "pending"|"rejected" }
 ```
 
 ### Verify Application

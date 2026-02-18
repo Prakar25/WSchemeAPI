@@ -22,6 +22,12 @@ router.use("/seed", require("./seed"));
 // Public user lookup routes
 router.use("/public-users", require("./publicUsers"));
 
+// Public user authentication routes (registration and login via mobile + OTP)
+router.use("/public-auth", require("./publicAuth"));
+
+// Public user profile routes (complete profile and document uploads)
+router.use("/public-profile", require("./publicProfile"));
+
 // Admin user login routes
 router.use("/admin-login", require("./adminUsers"));
 

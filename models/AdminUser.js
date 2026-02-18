@@ -9,6 +9,7 @@ const ADMIN_ROLES = {
   DEPARTMENT_HEAD: 'Department Head',
   DEPARTMENT_SECRETARY: 'Department Secretary',
   ADMIN: 'Admin',
+  CSD_ADMIN: 'CSDAdmin', // Citizen Service Desk Admin - verifies public users via bio-authentication
   SUPER_ADMIN: 'Super Admin'
 };
 
@@ -16,6 +17,7 @@ const ADMIN_ROLES = {
 const ROLE_LEVELS = {
   [ADMIN_ROLES.SUPER_ADMIN]: 1,
   [ADMIN_ROLES.ADMIN]: 2,
+  [ADMIN_ROLES.CSD_ADMIN]: 2.5, // Same level as Admin, specialized for user verification
   [ADMIN_ROLES.DEPARTMENT_SECRETARY]: 3,
   [ADMIN_ROLES.DEPARTMENT_HEAD]: 4,
   [ADMIN_ROLES.DEPARTMENT_USER]: 5,

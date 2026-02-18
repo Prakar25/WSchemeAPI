@@ -16,7 +16,7 @@ router.get("/:user_id", async (req, res) => {
     }
 
     // Format response for dashboard
-    const maskedAadhaar = `**** **** ${user.aadhaarNumber.slice(-4)}`;
+    const maskedAadhaar = user.aadhaarNumber ? `**** **** ${user.aadhaarNumber.slice(-4)}` : null;
     const eligibilityStatus = user.economicStatus?.category || "Not Specified";
 
     res.status(200).json({
@@ -24,7 +24,7 @@ router.get("/:user_id", async (req, res) => {
         _id: user._id,
         fullName: user.demographics?.fullName || null,
         aadhaarNumber: maskedAadhaar,
-        aadhaarNumberFull: user.aadhaarNumber, // Include full for internal use
+        aadhaarNumberFull: user.aadhaarNumber || null, // Include full for internal use
         eligibilityStatus: eligibilityStatus,
         economicStatus: user.economicStatus || null,
         dob: user.demographics?.dob?.date || null,
@@ -73,7 +73,7 @@ router.get("/", async (req, res) => {
     }
 
     // Format response for dashboard
-    const maskedAadhaar = `**** **** ${user.aadhaarNumber.slice(-4)}`;
+    const maskedAadhaar = user.aadhaarNumber ? `**** **** ${user.aadhaarNumber.slice(-4)}` : null;
     const eligibilityStatus = user.economicStatus?.category || "Not Specified";
 
     res.status(200).json({
@@ -81,7 +81,7 @@ router.get("/", async (req, res) => {
         _id: user._id,
         fullName: user.demographics?.fullName || null,
         aadhaarNumber: maskedAadhaar,
-        aadhaarNumberFull: user.aadhaarNumber,
+        aadhaarNumberFull: user.aadhaarNumber || null,
         eligibilityStatus: eligibilityStatus,
         economicStatus: user.economicStatus || null,
         dob: user.demographics?.dob?.date || null,
@@ -133,7 +133,7 @@ router.put("/:user_id", async (req, res) => {
     }
 
     // Format response
-    const maskedAadhaar = `**** **** ${user.aadhaarNumber.slice(-4)}`;
+    const maskedAadhaar = user.aadhaarNumber ? `**** **** ${user.aadhaarNumber.slice(-4)}` : null;
     const eligibilityStatus = user.economicStatus?.category || "Not Specified";
 
     res.status(200).json({

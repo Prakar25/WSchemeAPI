@@ -10,6 +10,15 @@ const app = express();
 const deleteFileFromServer = require("./routes/deleteFileFromServer");
 
 // Middleware
+// Normalize double (or multiple) leading slashes so static files work when frontend uses baseURL + filePath
+app.use((req, res, next) => {
+  if (req.path.startsWith("//")) {
+    const normalized = "/" + req.path.replace(/^\/+/, "");
+    return res.redirect(302, normalized);
+  }
+  next();
+});
+
 // Configure CORS to allow credentials from frontend
 app.use(
   cors({

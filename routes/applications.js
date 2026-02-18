@@ -8,6 +8,7 @@ const { checkEligibility } = require("../utils/eligibilityUtils");
 const adminAuth = require("../middleware/adminAuth");
 
 // POST /api/applications/apply - Apply to a scheme
+// Universal rule: only public users with verificationStatus === "verified" can apply; others get 403
 router.post("/apply", async (req, res) => {
   try {
     const { user_id, scheme_id, form_data, documents_submitted } = req.body;
@@ -25,6 +26,19 @@ router.post("/apply", async (req, res) => {
       return res.status(404).json({
         status: "error",
         message: "User not found",
+      });
+    }
+
+    // Only verified public users can apply to schemes (universal rule)
+    const verificationStatus = user.status?.verificationStatus || "pending";
+    if (verificationStatus !== "verified") {
+      return res.status(403).json({
+        status: "error",
+        message:
+          verificationStatus === "rejected"
+            ? "Your account verification was rejected. You cannot apply to schemes. Please contact support."
+            : "You must complete verification before applying to schemes. Please visit a CSDAdmin for bio-authentication. You can view schemes in the meantime.",
+        verificationStatus,
       });
     }
 

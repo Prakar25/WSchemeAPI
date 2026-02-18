@@ -43,4 +43,7 @@ router.use("/categories", require("./categories"));
 // Department routes
 router.use("/departments", require("./departments"));
 
+// Bulk upload routes
+router.use("/bulk-upload", require("./bulkUpload"));
+
 module.exports = router;

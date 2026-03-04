@@ -40,6 +40,15 @@ router.use("/admin/dashboard", require("./adminDashboard"));
 // Admin profile routes
 router.use("/admin/profile", require("./adminProfile"));
 
+// Admin registration (public, no auth)
+router.use("/admin-register", require("./adminRegister"));
+
+// Admin verification (pending-admins, verify-admin) - mount after specific /admin/* paths
+router.use("/admin", require("./adminVerification"));
+
+// CSDAdmin verification - verify public users (pending-public-users, verify-public-user)
+router.use("/csd", require("./csdVerification"));
+
 // Application routes
 router.use("/applications", require("./applications"));
 

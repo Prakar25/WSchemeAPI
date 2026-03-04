@@ -49,6 +49,21 @@ const adminAuth = async (req, res, next) => {
       });
     }
 
+    // Reject pending or rejected admins
+    const status = admin.status || "verified";
+    if (status === "pending") {
+      return res.status(403).json({
+        status: "error",
+        message: "Your account is pending verification.",
+      });
+    }
+    if (status === "rejected") {
+      return res.status(403).json({
+        status: "error",
+        message: "Your account verification was rejected. Please contact support.",
+      });
+    }
+
     // Attach admin info to request for use in routes
     req.admin = {
       _id: admin._id,

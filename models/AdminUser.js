@@ -13,17 +13,30 @@ const ADMIN_ROLES = {
   SUPER_ADMIN: 'Super Admin'
 };
 
-// Role hierarchy levels for comparison (Super Admin = 1, descending)
+// Role hierarchy levels for comparison (Super Admin = 1, descending; 2-8 selectable in registration)
+// Level 9 = CSDAdmin (exclusive role, assigned separately, not available in admin registration)
 const ROLE_LEVELS = {
   [ADMIN_ROLES.SUPER_ADMIN]: 1,
   [ADMIN_ROLES.ADMIN]: 2,
-  [ADMIN_ROLES.CSD_ADMIN]: 2.5, // Same level as Admin, specialized for user verification
   [ADMIN_ROLES.DEPARTMENT_SECRETARY]: 3,
   [ADMIN_ROLES.DEPARTMENT_HEAD]: 4,
   [ADMIN_ROLES.DEPARTMENT_USER]: 5,
   [ADMIN_ROLES.DISTRICTHQ_HEAD]: 6,
   [ADMIN_ROLES.DISTRICT_OVERLOOKERS]: 7,
-  [ADMIN_ROLES.POST_OPERATOR]: 8
+  [ADMIN_ROLES.POST_OPERATOR]: 8,
+  [ADMIN_ROLES.CSD_ADMIN]: 9, // Exclusive role - verifies public users; not in registration (2-8)
+};
+
+// Map roleLevel (2-9) from admin registration to role string
+const ROLE_LEVEL_TO_ROLE = {
+  2: ADMIN_ROLES.ADMIN,
+  3: ADMIN_ROLES.DEPARTMENT_SECRETARY,
+  4: ADMIN_ROLES.DEPARTMENT_HEAD,
+  5: ADMIN_ROLES.DEPARTMENT_USER,
+  6: ADMIN_ROLES.DISTRICTHQ_HEAD,
+  7: ADMIN_ROLES.DISTRICT_OVERLOOKERS,
+  8: ADMIN_ROLES.POST_OPERATOR,
+  9: ADMIN_ROLES.CSD_ADMIN, // Citizen Service Desk - verifies public users
 };
 
 const adminUserSchema = new mongoose.Schema({
@@ -39,10 +52,18 @@ const adminUserSchema = new mongoose.Schema({
     trim: true,
     lowercase: true
   },
+  email: {
+    type: String,
+    required: false,
+    trim: true,
+    lowercase: true,
+    default: null
+  },
   contactNumber: {
     type: String,
-    required: [true, 'Contact number is required'],
-    trim: true
+    required: false,
+    trim: true,
+    default: null
   },
   password: {
     type: String,
@@ -64,6 +85,25 @@ const adminUserSchema = new mongoose.Schema({
     type: String,
     required: false,
     trim: true,
+    default: null
+  },
+  status: {
+    type: String,
+    enum: ['pending', 'verified', 'rejected'],
+    default: 'verified' // Existing admins remain verified; new registrations set pending
+  },
+  rejectionReason: {
+    type: String,
+    required: false,
+    default: null
+  },
+  verifiedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AdminUser',
+    default: null
+  },
+  verifiedAt: {
+    type: Date,
     default: null
   },
   isActive: {
@@ -92,6 +132,7 @@ const AdminUser = mongoose.model('AdminUser', adminUserSchema);
 // Attach roles and levels to the model for easy access
 AdminUser.ROLES = ADMIN_ROLES;
 AdminUser.ROLE_LEVELS = ROLE_LEVELS;
+AdminUser.ROLE_LEVEL_TO_ROLE = ROLE_LEVEL_TO_ROLE;
 
 // Index for faster queries
 adminUserSchema.index({ department: 1 });

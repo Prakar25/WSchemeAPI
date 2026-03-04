@@ -59,7 +59,7 @@ const applicationSchema = new mongoose.Schema(
     // Verification workflow level (store as number, not string)
     verification_level: {
       type: Number,
-      enum: [0, 7, 8, 1, 2, 6, 4, 5, 3, 99], // 0=Applied, 7/8=Post Operator, 1/2=Admin, 6=District, 4/5=Dept, 3=Secretary, 99=Completed
+      enum: [0, 9, 7, 8, 1, 2, 6, 4, 5, 3, 99], // 0=Applied, 9=CSD Admin (first), 7/8=Post Operator, 1/2=Admin, 6=District, 4/5=Dept, 3=Secretary, 99=Completed
       default: 0, // Applied
     },
     // Legacy field for backward compatibility (will be removed)
@@ -159,6 +159,7 @@ const applicationSchema = new mongoose.Schema(
 function getStageNameFromLevel(level) {
   const stageMap = {
     0: "Applied",
+    9: "CSD_Admin_Review",
     7: "Post_Operator_Review",
     8: "Post_Operator_Review",
     1: "Admin_Review",
@@ -175,7 +176,8 @@ function getStageNameFromLevel(level) {
 // Helper function to get required role levels for a verification level
 function getRequiredRoleLevels(level) {
   const levelMap = {
-    0: [7, 8], // Applied -> Post Operator (7, 8)
+    0: [9],    // Applied -> CSD Admin (9) first
+    9: [9],    // CSD Admin Review
     7: [7, 8], // Post Operator Review
     8: [7, 8], // Post Operator Review
     1: [1, 2], // Admin Review
@@ -186,7 +188,7 @@ function getRequiredRoleLevels(level) {
     3: [3],    // Secretary Review
     99: []     // Completed
   };
-  return levelMap[level] || [7, 8];
+  return levelMap[level] || [9];
 }
 
 // Virtual to get stage name

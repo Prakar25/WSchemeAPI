@@ -32,7 +32,11 @@ This document provides the exact request format for creating a scheme via `POST 
   "scheme_image_file_url": null,
   "excluded_schemes": [],
   "authorization_levels": [1, 2, 4, 5],
-  "approval_status": "pending_department_head_approval"
+  "approval_status": "pending_department_head_approval",
+  "custom_form_fields": [
+    { "field_key": "annual_income", "label": "Annual Income (INR)", "type": "number", "required": true },
+    { "field_key": "gender", "label": "Gender", "type": "select", "required": true, "options": "Male, Female" }
+  ]
 }
 ```
 
@@ -64,6 +68,7 @@ This document provides the exact request format for creating a scheme via `POST 
 | `excluded_schemes` | Array[String] | Excluded scheme IDs | `[]` or `["scheme_id_1", "scheme_id_2"]` |
 | `authorization_levels` | Array[Number] | Authorization levels (max 4) | `[1, 2, 4, 5]` |
 | `approval_status` | String | Initial approval status | `"pending_department_head_approval"` |
+| `custom_form_fields` | Array[Object] | Per-scheme form field definitions | See below |
 
 ---
 
@@ -135,6 +140,25 @@ category: "69652454b19f52b831b4ce4d"
 department: "Education Department"
 category: "Education"
 ```
+
+### 7. `custom_form_fields` (Optional Array)
+
+Per-scheme dynamic form field definitions. Each scheme can define its own form inputs for applicants.
+
+```json
+[
+  { "field_key": "annual_income", "label": "Annual Income (INR)", "field_type": "number", "required": true },
+  { "field_key": "caste_category", "label": "Caste Category", "field_type": "select", "required": true, "options": ["SC", "ST", "OBC", "General"] }
+]
+```
+
+- **`field_key`** (required): Unique key, used in application `form_data`
+- **`label`** (required): Display label
+- **`type`** or **`field_type`**: `text`, `number`, `select`, `date`, `textarea`, `checkbox` (default: `text`)
+- **`required`**: boolean (default: false)
+- **`options`**: For `select` type only – comma-separated string (e.g. `"Male, Female"`) or array (e.g. `["Male", "Female"]`)
+
+Empty array `[]` if no custom fields. Both `POST /api/schemes` and `POST /api/schemes/update` accept this. See `SCHEME_CREATION_DYNAMIC_FORM_GUIDE.md` for full details.
 
 ---
 
@@ -422,6 +446,13 @@ interface SchemeCreationRequest {
   excluded_schemes?: string[]; // Array of ObjectId strings
   authorization_levels?: number[]; // Max 4 items
   approval_status?: "pending_department_head_approval" | "approved" | "rejected";
+  custom_form_fields?: Array<{
+    field_key: string;
+    label: string;
+    type?: "text" | "number" | "select" | "date" | "textarea" | "checkbox";
+    required?: boolean;
+    options?: string | string[]; // comma-separated string or array
+  }>;
 }
 ```
 

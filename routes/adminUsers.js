@@ -36,6 +36,21 @@ router.post("/", async (req, res) => {
       });
     }
 
+    // Reject pending admins (must be verified by Super Admin or Secretary)
+    const status = user.status || "verified";
+    if (status === "pending") {
+      return res.status(403).json({
+        status: "error",
+        message: "Your account is pending verification.",
+      });
+    }
+    if (status === "rejected") {
+      return res.status(403).json({
+        status: "error",
+        message: "Your account verification was rejected. Please contact support.",
+      });
+    }
+
     // Get role level
     const roleLevel = AdminUser.ROLE_LEVELS[user.role] || 0;
 

@@ -1,6 +1,25 @@
 const express = require("express");
 const router = express.Router();
 const Scheme = require("../models/Scheme");
+
+// Normalize custom_form_fields from API payload: accepts "type" or "field_type", "options" as string or array
+function normalizeCustomFormFields(fields) {
+  if (!Array.isArray(fields)) return [];
+  return fields.map((f) => {
+    const field_type = f.field_type ?? f.type ?? "text";
+    let options = f.options;
+    if (typeof options === "string") {
+      options = options.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    return {
+      field_key: f.field_key,
+      label: f.label,
+      field_type,
+      required: !!f.required,
+      options: Array.isArray(options) ? options : [],
+    };
+  });
+}
 const Application = require("../models/Application");
 const PublicUser = require("../models/PublicUser");
 const AdminUser = require("../models/AdminUser");
@@ -10,15 +29,30 @@ const requireRole = require("../middleware/requireRole");
 const path = require("path");
 const fs = require("fs");
 
+// Parse age_group (e.g. "20-30", "70_and_above") into { minAge, maxAge } or null
+function parseAgeGroup(ageGroup) {
+  if (!ageGroup || ageGroup === "all" || ageGroup === "") return null;
+  if (ageGroup === "70_and_above") return { minAge: 70, maxAge: 150 };
+  const match = String(ageGroup).match(/^(\d+)-(\d+)$/);
+  if (match) {
+    const min = parseInt(match[1], 10);
+    const max = parseInt(match[2], 10);
+    if (!Number.isNaN(min) && !Number.isNaN(max)) return { minAge: min, maxAge: max };
+  }
+  return null;
+}
+
 // GET /api/schemes - Get all schemes
 // Optional query params: 
 //   - filter_type: "scheme" or "applicant" (default: "applicant" if user_id is provided, otherwise "scheme")
 //   - user_id: Filter based on excluded schemes (applicant filter - only works with filter_type="applicant")
 //   - approved_only: Only return approved schemes (scheme filter - only works with filter_type="scheme")
 //   - pending_approval: Return schemes pending approval AND approved schemes (scheme filter - only works with filter_type="scheme")
+//   - category_id: Filter by category (ObjectId string)
+//   - age_group: Filter by age range overlap. Values: "20-30", "30-40", "40-50", "50-60", "60-70", "70_and_above", "all"
 router.get("/", async (req, res) => {
   try {
-    const { user_id, approved_only, pending_approval, filter_type } = req.query;
+    const { user_id, approved_only, pending_approval, filter_type, category_id, age_group } = req.query;
     
     // Determine filter type: "scheme" or "applicant"
     // Default: "applicant" if user_id is provided, otherwise "scheme"
@@ -40,6 +74,18 @@ router.get("/", async (req, res) => {
         // pending_approval shows both pending and approved schemes
         query.approval_status = { $in: ["pending_department_head_approval", "approved"] };
       }
+    }
+
+    // category_id: filter by category (scheme.category stores ObjectId string)
+    if (category_id && String(category_id).trim() !== "") {
+      query.category = String(category_id).trim();
+    }
+
+    // age_group: include schemes whose eligibility range overlaps with the selected age range
+    const ageRange = parseAgeGroup(age_group);
+    if (ageRange) {
+      query["scheme_eligibility.lower_age_limit"] = { $lte: ageRange.maxAge };
+      query["scheme_eligibility.upper_age_limit"] = { $gte: ageRange.minAge };
     }
     
     let schemes = await Scheme.find(query).sort({ createdAt: -1 });
@@ -120,10 +166,45 @@ router.get("/simple", async (req, res) => {
   }
 });
 
+// GET /api/schemes/:id - Get a single scheme by ID (includes custom_form_fields)
+router.get("/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const scheme = await Scheme.findById(id);
+
+    if (!scheme) {
+      return res.status(404).json({
+        status: "error",
+        error: "Scheme not found",
+        message: `No scheme found with ID: ${id}`,
+      });
+    }
+
+    res.status(200).json(scheme);
+  } catch (error) {
+    console.error("Error fetching scheme:", error);
+    if (error.name === "CastError") {
+      return res.status(400).json({
+        status: "error",
+        error: "Invalid scheme ID",
+        message: "Invalid ID format",
+      });
+    }
+    res.status(500).json({
+      status: "error",
+      error: "Failed to fetch scheme",
+      message: error.message,
+    });
+  }
+});
+
 // POST /api/schemes - Create a new scheme
 router.post("/", async (req, res) => {
   try {
-    const schemeData = req.body;
+    const schemeData = { ...req.body };
+    if (schemeData.custom_form_fields !== undefined) {
+      schemeData.custom_form_fields = normalizeCustomFormFields(schemeData.custom_form_fields);
+    }
 
     // Create new scheme
     const scheme = await Scheme.create(schemeData);
@@ -169,6 +250,9 @@ router.post("/update", async (req, res) => {
     }
 
     // Update the scheme fields
+    if (updateData.custom_form_fields !== undefined) {
+      updateData.custom_form_fields = normalizeCustomFormFields(updateData.custom_form_fields);
+    }
     Object.keys(updateData).forEach((key) => {
       if (updateData[key] !== undefined) {
         existingScheme[key] = updateData[key];

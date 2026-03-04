@@ -7,6 +7,90 @@ const AdminUser = require("../models/AdminUser");
 const { checkEligibility } = require("../utils/eligibilityUtils");
 const adminAuth = require("../middleware/adminAuth");
 
+/**
+ * Validate form_data against scheme.custom_form_fields.
+ * Returns { valid: boolean, sanitizedFormData: object, errors: [{ field, message }] }.
+ */
+function validateFormData(formData, customFormFields) {
+  const errors = [];
+  const sanitized = {};
+
+  if (!Array.isArray(customFormFields) || customFormFields.length === 0) {
+    return { valid: true, sanitizedFormData: formData && typeof formData === "object" ? formData : {}, errors: [] };
+  }
+
+  const fieldMap = {};
+  customFormFields.forEach((f) => { fieldMap[f.field_key] = f; });
+
+  for (const field of customFormFields) {
+    const key = field.field_key;
+    const type = field.field_type || field.type || "text";
+    const label = field.label || key;
+    const value = formData && formData[key];
+
+    // Required check
+    const isEmpty = value === undefined || value === null || value === "";
+    const isCheckboxEmpty = type === "checkbox" && (value !== true && value !== false && value !== 1 && value !== 0);
+
+    if (field.required) {
+      if (type === "checkbox") {
+        if (isCheckboxEmpty || value === false || value === 0) {
+          errors.push({ field: key, message: `${label} is required` });
+        }
+      } else if (isEmpty) {
+        errors.push({ field: key, message: `${label} is required` });
+      }
+    }
+
+    if (errors.some((e) => e.field === key)) continue; // Skip further validation for this field if already errored
+
+    if (isEmpty && !field.required) continue;
+
+    // Type-specific validation
+    if (type === "number") {
+      const num = Number(value);
+      if (field.required && (value === "" || value === null || Number.isNaN(num))) {
+        errors.push({ field: key, message: `${label} must be a valid number` });
+      } else if (!isEmpty && Number.isNaN(num)) {
+        errors.push({ field: key, message: `${label} must be a valid number` });
+      } else if (!isEmpty) {
+        sanitized[key] = num;
+      }
+    } else if (type === "select") {
+      const options = Array.isArray(field.options)
+        ? field.options
+        : (typeof field.options === "string" ? field.options.split(",").map((s) => s.trim()) : []);
+      const trimmedValue = typeof value === "string" ? String(value).trim() : value;
+      const invalidOption = options.length > 0 && trimmedValue !== "" && !options.includes(trimmedValue);
+      if (invalidOption) {
+        errors.push({ field: key, message: `Invalid option selected for ${label}` });
+      } else if (!isEmpty) {
+        sanitized[key] = trimmedValue;
+      }
+    } else if (type === "date") {
+      const dateVal = value ? new Date(value) : null;
+      if (field.required && (!value || !dateVal || Number.isNaN(dateVal.getTime()))) {
+        errors.push({ field: key, message: `${label} must be a valid date` });
+      } else if (!isEmpty && Number.isNaN(dateVal?.getTime())) {
+        errors.push({ field: key, message: `${label} must be a valid date` });
+      } else if (!isEmpty) {
+        sanitized[key] = typeof value === "string" ? value : dateVal?.toISOString?.();
+      }
+    } else if (type === "checkbox") {
+      sanitized[key] = !!value;
+    } else {
+      sanitized[key] = typeof value === "string" ? value.trim() : String(value);
+    }
+  }
+
+  const valid = errors.length === 0;
+  return {
+    valid,
+    sanitizedFormData: valid ? sanitized : (formData && typeof formData === "object" ? formData : {}),
+    errors,
+  };
+}
+
 // POST /api/applications/apply - Apply to a scheme
 // Universal rule: only public users with verificationStatus === "verified" can apply; others get 403
 router.post("/apply", async (req, res) => {
@@ -75,20 +159,26 @@ router.post("/apply", async (req, res) => {
       });
     }
 
+    // Validate form_data against scheme.custom_form_fields
+    const customFormFields = scheme.custom_form_fields || [];
+    const validation = validateFormData(form_data, customFormFields);
+    if (!validation.valid) {
+      return res.status(422).json({
+        status: "error",
+        message: "Validation failed",
+        errors: validation.errors,
+      });
+    }
+
+    // Use sanitized form_data (only keys from custom_form_fields; validated values)
+    const sanitizedFormData = validation.sanitizedFormData;
+
     // Get authorization levels from scheme (workflow sequence)
     const authorizationLevels = scheme.authorization_levels || [];
-    
-    // Determine initial verification level
-    // If authorization_levels exist, start with the first level
-    // Otherwise, use default workflow (start at Post Operator level 7/8)
-    let initialVerificationLevel = 7; // Default: Post Operator
+
+    // Applications ALWAYS start at CSD Admin (level 9) first
+    let initialVerificationLevel = 9;
     let authorizationLevelIndex = 0;
-    
-    if (authorizationLevels.length > 0) {
-      // Start at the first authorization level
-      initialVerificationLevel = authorizationLevels[0];
-      authorizationLevelIndex = 0;
-    }
 
     // Create application - starts at first authorization level or default
     // Get ApplicationModel helper functions (getStageNameFromLevel is exported from the model)
@@ -102,7 +192,7 @@ router.post("/apply", async (req, res) => {
       verification_stage: ApplicationModel.getStageNameFromLevel(initialVerificationLevel), // Legacy field
       authorization_levels: authorizationLevels, // Store the workflow sequence
       authorization_level_index: authorizationLevelIndex, // Start at first level
-      form_data: form_data || {},
+      form_data: sanitizedFormData,
       documents_submitted: documents_submitted || [],
     });
 
@@ -333,10 +423,11 @@ router.get("/:id", adminAuth, async (req, res) => {
     const ApplicationModel = require("../models/Application");
     const currentLevel = application.verification_level || 0;
     const requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
-    
+
     // Get next level
     let nextLevel = null;
-    if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
+    if (currentLevel === 9) nextLevel = 7;
+    else if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
     else if (currentLevel === 1 || currentLevel === 2) nextLevel = 6;
     else if (currentLevel === 6) nextLevel = 4;
     else if (currentLevel === 4 || currentLevel === 5) nextLevel = 3;
@@ -382,7 +473,8 @@ router.get("/:id", adminAuth, async (req, res) => {
 // Helper function to get stage requirements
 function getStageRequirements(stage) {
   const requirements = {
-    Applied: { roleLevels: [7, 8], roleNames: ["District Overlookers", "Post Operator"] },
+    Applied: { roleLevels: [9], roleNames: ["CSD Admin"] },
+    CSD_Admin_Review: { roleLevels: [9], roleNames: ["CSD Admin"] },
     Post_Operator_Review: { roleLevels: [7, 8], roleNames: ["District Overlookers", "Post Operator"] },
     Admin_Review: { roleLevels: [1, 2], roleNames: ["Super Admin", "Admin"] },
     District_Head_Review: { roleLevels: [6], roleNames: ["DistrictHQ Head"] },
@@ -396,7 +488,8 @@ function getStageRequirements(stage) {
 // Helper function to get next stage requirements
 function getNextStageRequirements(stage) {
   const nextStages = {
-    Applied: "Post_Operator_Review",
+    Applied: "CSD_Admin_Review",
+    CSD_Admin_Review: "Post_Operator_Review",
     Post_Operator_Review: "Admin_Review",
     Admin_Review: "District_Head_Review",
     District_Head_Review: "Department_Review",
@@ -424,15 +517,16 @@ router.get("/:id/next-stage-admins", adminAuth, async (req, res) => {
 
     const ApplicationModel = require("../models/Application");
     const currentLevel = application.verification_level || 0;
-    
+
     // Get next level
     let nextLevel = null;
-    if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
+    if (currentLevel === 9) nextLevel = 7;
+    else if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
     else if (currentLevel === 1 || currentLevel === 2) nextLevel = 6;
     else if (currentLevel === 6) nextLevel = 4;
     else if (currentLevel === 4 || currentLevel === 5) nextLevel = 3;
     else if (currentLevel === 3) nextLevel = 99;
-    
+
     if (!nextLevel || nextLevel === 99) {
       return res.status(200).json({
         status: "success",
@@ -510,7 +604,8 @@ router.get("/:id/next-stage-admins", adminAuth, async (req, res) => {
 // Helper function to get next stage name
 function getNextStageName(stage) {
   const nextStages = {
-    Applied: "Post_Operator_Review",
+    Applied: "CSD_Admin_Review",
+    CSD_Admin_Review: "Post_Operator_Review",
     Post_Operator_Review: "Admin_Review",
     Admin_Review: "District_Head_Review",
     District_Head_Review: "Department_Review",
@@ -565,6 +660,7 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     if (currentLevel === null || currentLevel === undefined) {
       const stageMap = {
         "Applied": 0,
+        "CSD_Admin_Review": 9,
         "Post_Operator_Review": 7,
         "Admin_Review": 1,
         "District_Head_Review": 6,
@@ -572,7 +668,7 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
         "Secretary_Review": 3,
         "Completed": 99
       };
-      currentLevel = stageMap[application.verification_stage] || 7; // Default to 7 if unknown
+      currentLevel = stageMap[application.verification_stage] || 9; // Default to 9 (CSD Admin) if unknown
       // Update the application with the level
       application.verification_level = currentLevel;
     }
@@ -587,8 +683,11 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     const useSchemeWorkflow = authorizationLevels.length > 0;
     
     // Get required role levels for current verification level
+    // Level 9 (CSD Admin) is always handled by CSD Admin, regardless of scheme workflow
     let requiredRoleLevels = [];
-    if (useSchemeWorkflow) {
+    if (currentLevel === 9) {
+      requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(9); // [9] - CSD Admin only
+    } else if (useSchemeWorkflow) {
       // For scheme-specific workflow, check if current level matches the expected level at current index
       if (authorizationLevelIndex < authorizationLevels.length) {
         const expectedLevel = authorizationLevels[authorizationLevelIndex];
@@ -608,7 +707,11 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     
     if (canVerify) {
       if (action === "Verified" || action === "Forwarded") {
-        if (useSchemeWorkflow) {
+        // CSD Admin (9) always forwards to Post Operator (7) first
+        if (currentLevel === 9) {
+          nextLevel = 7;
+          nextAuthorizationLevelIndex = 0;
+        } else if (useSchemeWorkflow) {
           // Move to next level in authorization_levels array
           nextAuthorizationLevelIndex = authorizationLevelIndex + 1;
           if (nextAuthorizationLevelIndex < authorizationLevels.length) {
@@ -618,8 +721,10 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
             nextLevel = 99; // Completed
           }
         } else {
-          // Use default workflow: 7/8 -> 6 -> 3 -> Completed
-          if (currentLevel === 7 || currentLevel === 8) {
+          // Use default workflow: 9 -> 7 -> 6 -> 3 -> Completed
+          if (currentLevel === 9) {
+            nextLevel = 7; // CSD Admin -> Post Operator
+          } else if (currentLevel === 7 || currentLevel === 8) {
             nextLevel = 6; // Post Operator -> District Head
           } else if (currentLevel === 6) {
             nextLevel = 3; // District Head -> Secretary
@@ -638,13 +743,15 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
             nextLevel = currentLevel;
           }
         } else {
-          // Use default workflow for returns: 3 -> 6 -> 7/8 -> (can't go back)
+          // Use default workflow for returns: 3 -> 6 -> 7/8 -> 9 -> (can't go back)
           if (currentLevel === 3) {
             nextLevel = 6; // Secretary -> District Head
           } else if (currentLevel === 6) {
             nextLevel = 7; // District Head -> Post Operator
           } else if (currentLevel === 7 || currentLevel === 8) {
-            nextLevel = currentLevel; // Stay at Post Operator (can't go back further)
+            nextLevel = 9; // Post Operator -> CSD Admin
+          } else if (currentLevel === 9) {
+            nextLevel = currentLevel; // Stay at CSD Admin (can't go back further)
           }
         }
       }
@@ -925,6 +1032,7 @@ router.get("/user/:user_id/summary", async (req, res) => {
     // Count by verification stage
     const stageCounts = {
       applied: 0,
+      csd_admin_review: 0,
       post_operator_review: 0,
       admin_review: 0,
       district_review: 0,
@@ -946,6 +1054,7 @@ router.get("/user/:user_id/summary", async (req, res) => {
 
       // Update stage counts
       if (level === 0) stageCounts.applied++;
+      else if (level === 9) stageCounts.csd_admin_review++;
       else if (level === 7 || level === 8) stageCounts.post_operator_review++;
       else if (level === 1 || level === 2) stageCounts.admin_review++;
       else if (level === 6) stageCounts.district_review++;
@@ -1084,10 +1193,11 @@ router.get("/user/:user_id/:application_id", async (req, res) => {
     // Transform to include all details
     const ApplicationModel = require("../models/Application");
     const currentLevel = application.verification_level || 0;
-    
+
     // Get next level info
     let nextLevel = null;
-    if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
+    if (currentLevel === 9) nextLevel = 7;
+    else if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
     else if (currentLevel === 1 || currentLevel === 2) nextLevel = 6;
     else if (currentLevel === 6) nextLevel = 4;
     else if (currentLevel === 4 || currentLevel === 5) nextLevel = 3;
@@ -1178,6 +1288,7 @@ function getStatusDisplay(status) {
 function getVerificationStageDisplay(level) {
   const stageMap = {
     0: "Application Submitted",
+    9: "CSD Admin Review",
     7: "Post Operator Review",
     8: "Post Operator Review",
     1: "Admin Review",

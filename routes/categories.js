@@ -41,7 +41,8 @@ router.get("/simple", async (req, res) => {
       .sort({ category_display_name: 1 });
 
     const categoryList = categories.map((cat) => ({
-      _id: cat._id.toString(), // ObjectId as string for scheme creation
+      _id: cat._id.toString(),
+      category_name: cat.category_name,
       name: cat.category_name,
       displayName: cat.category_display_name,
     }));

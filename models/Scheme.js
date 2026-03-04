@@ -106,6 +106,38 @@ const schemeSchema = new mongoose.Schema(
       ],
       default: [],
     },
+    // Per-scheme dynamic form fields - defines extra inputs for this scheme's application form
+    // Admin adds/removes these when creating or editing a scheme; applicants fill values in form_data
+    custom_form_fields: {
+      type: [
+        {
+          field_key: {
+            type: String,
+            required: [true, "Field key is required"],
+            trim: true,
+          },
+          label: {
+            type: String,
+            required: [true, "Label is required"],
+            trim: true,
+          },
+          field_type: {
+            type: String,
+            enum: ["text", "number", "select", "date", "textarea", "checkbox"],
+            default: "text",
+          },
+          required: {
+            type: Boolean,
+            default: false,
+          },
+          options: {
+            type: [String],
+            default: [],
+          }, // for select type only
+        },
+      ],
+      default: [],
+    },
     // Authorization levels for the scheme (in order of authorization flow)
     // Based on ADMIN_ROLES_ENUM.md: 8=Super Admin, 7=Admin, 6=Department Secretary, 
     // 5=Department Head, 4=Department User, 3=DistrictHQ Head, 2=District Overlookers, 1=Post Operator

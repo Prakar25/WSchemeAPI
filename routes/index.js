@@ -61,4 +61,7 @@ router.use("/departments", require("./departments"));
 // Bulk upload routes
 router.use("/bulk-upload", require("./bulkUpload"));
 
+// Ads routes (public + admin)
+router.use("/ads", require("./ads"));
+
 module.exports = router;

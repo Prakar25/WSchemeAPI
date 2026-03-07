@@ -1,44 +1,58 @@
 /**
  * Admin Authentication Middleware
- * 
- * For now, this is a simple middleware that checks for admin credentials.
- * In production, you should use JWT tokens or session-based authentication.
+ *
+ * Supports two auth methods (in order):
+ * 1. JWT: Authorization: Bearer <token> (from POST /api/admin-login)
+ * 2. Headers: x-admin-username + x-admin-password (legacy)
  */
 
 const AdminUser = require("../models/AdminUser");
+const { verifyAdminToken } = require("../utils/jwtUtils");
 
 const adminAuth = async (req, res, next) => {
   try {
-    // Get credentials from headers, body, or query
-    const username = 
-      req.headers["x-admin-username"] || 
-      req.body?.username || 
-      req.query?.username || 
-      "";
-    const password = 
-      req.headers["x-admin-password"] || 
-      req.body?.password || 
-      req.query?.password || 
-      "";
+    let admin = null;
 
-    // If no credentials provided, return unauthorized
-    if (!username || !password) {
-      return res.status(401).json({
-        status: "error",
-        message: "Admin authentication required",
-      });
+    // 1. Try JWT first (Authorization: Bearer <token>)
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      const token = authHeader.slice(7);
+      const decoded = verifyAdminToken(token);
+      if (decoded && decoded.adminId) {
+        admin = await AdminUser.findById(decoded.adminId);
+      }
     }
 
-    // Verify admin credentials
-    const admin = await AdminUser.findOne({ 
-      username: username.trim().toLowerCase() 
-    });
+    // 2. Fall back to username/password headers (legacy)
+    if (!admin) {
+      const username =
+        req.headers["x-admin-username"] ||
+        req.body?.username ||
+        req.query?.username ||
+        "";
+      const password =
+        req.headers["x-admin-password"] ||
+        req.body?.password ||
+        req.query?.password ||
+        "";
 
-    if (!admin || admin.password !== password.trim()) {
-      return res.status(401).json({
-        status: "error",
-        message: "Invalid admin credentials",
+      if (!username || !password) {
+        return res.status(401).json({
+          status: "error",
+          message: "Admin authentication required",
+        });
+      }
+
+      admin = await AdminUser.findOne({
+        username: username.trim().toLowerCase(),
       });
+
+      if (!admin || admin.password !== password.trim()) {
+        return res.status(401).json({
+          status: "error",
+          message: "Invalid admin credentials",
+        });
+      }
     }
 
     // Check if admin is active
@@ -70,7 +84,7 @@ const adminAuth = async (req, res, next) => {
       username: admin.username,
       fullName: admin.fullName,
       role: admin.role,
-      roleLevel: admin.constructor.ROLE_LEVELS[admin.role] || 0,
+      roleLevel: AdminUser.ROLE_LEVELS[admin.role] || 0,
       department: admin.department || null,
       departmentId: admin.departmentId || null,
     };

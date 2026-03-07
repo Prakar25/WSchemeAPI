@@ -2,9 +2,11 @@ const express = require("express");
 const router = express.Router();
 const AdminUser = require("../models/AdminUser");
 const adminAuth = require("../middleware/adminAuth");
+const { signAdminToken } = require("../utils/jwtUtils");
 
 // POST /api/admin-login
 // Accepts credentials in body or query: { username, password }
+// Returns user info + token (JWT) for subsequent requests via Authorization: Bearer <token>
 router.post("/", async (req, res) => {
   const username = (req.body?.username || req.query?.username || "")
     .trim()
@@ -54,8 +56,17 @@ router.post("/", async (req, res) => {
     // Get role level
     const roleLevel = AdminUser.ROLE_LEVELS[user.role] || 0;
 
+    // Issue JWT for subsequent requests
+    const token = signAdminToken({
+      adminId: user._id,
+      username: user.username,
+      role: user.role,
+      roleLevel,
+    });
+
     return res.status(200).json({
       status: "success",
+      token,
       user: {
         _id: user._id,
         fullName: user.fullName,

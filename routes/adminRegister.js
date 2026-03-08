@@ -3,6 +3,7 @@ const router = express.Router();
 const AdminUser = require("../models/AdminUser");
 const Department = require("../models/Department");
 const mongoose = require("mongoose");
+const { hashPassword, validatePasswordStrength } = require("../utils/passwordUtils");
 
 /**
  * GET /api/admin-registration-options
@@ -79,10 +80,11 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (!passwordTrimmed || passwordTrimmed.length < 6) {
+    const pwdValidation = validatePasswordStrength(passwordTrimmed);
+    if (!pwdValidation.valid) {
       return res.status(400).json({
         status: "error",
-        message: "Password must be at least 6 characters",
+        message: pwdValidation.message,
       });
     }
 
@@ -164,9 +166,11 @@ router.post("/", async (req, res) => {
       });
     }
 
+    const passwordHash = await hashPassword(passwordTrimmed);
+
     const admin = await AdminUser.create({
       username: usernameTrimmed,
-      password: passwordTrimmed,
+      password: passwordHash,
       fullName: fullNameTrimmed,
       email: emailTrimmed,
       contactNumber: contactNumber != null ? String(contactNumber).trim() : null,

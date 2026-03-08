@@ -2,22 +2,46 @@ const express = require("express");
 const router = express.Router();
 const Scheme = require("../models/Scheme");
 
-// Normalize custom_form_fields from API payload: accepts "type" or "field_type", "options" as string or array
+// Derive field_key from title: "Scheme Name" -> "scheme_name"
+function titleToFieldKey(title) {
+  if (!title || typeof title !== "string") return "";
+  return title
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]/g, "");
+}
+
+// Normalize custom_form_fields: accepts title (display) or label, derives field_key from title
+// Multiple fields are stored. Supports depends_on for conditional/sub-fields.
 function normalizeCustomFormFields(fields) {
   if (!Array.isArray(fields)) return [];
-  return fields.map((f) => {
+  return fields.map((f, i) => {
+    const title = f.title ?? f.label ?? "";
+    const field_key =
+      f.field_key && String(f.field_key).trim()
+        ? String(f.field_key).trim().toLowerCase().replace(/\s+/g, "_")
+        : titleToFieldKey(title);
     const field_type = f.field_type ?? f.type ?? "text";
     let options = f.options;
     if (typeof options === "string") {
       options = options.split(",").map((s) => s.trim()).filter(Boolean);
     }
-    return {
-      field_key: f.field_key,
-      label: f.label,
+    const normalized = {
+      field_key: field_key || `field_${i}`,
+      title: title || field_key,
+      label: title || field_key,
       field_type,
       required: !!f.required,
       options: Array.isArray(options) ? options : [],
     };
+    if (f.depends_on && f.depends_on.field_key) {
+      normalized.depends_on = {
+        field_key: String(f.depends_on.field_key).trim(),
+        value: f.depends_on.value,
+      };
+    }
+    return normalized;
   });
 }
 const Application = require("../models/Application");
@@ -412,11 +436,12 @@ router.post("/delete", async (req, res) => {
 });
 
 // PUT /api/schemes/:id/approve - Approve a scheme
-// Only Department Head, Department Secretary, or Super Admin can approve
+// Department Head, Department Secretary, Admin, or Super Admin can approve
 router.put("/:id/approve", adminAuth, requireRole([
-  AdminUser.ROLES.DEPARTMENT_HEAD,
+  AdminUser.ROLES.SUPER_ADMIN,
+  AdminUser.ROLES.ADMIN,
   AdminUser.ROLES.DEPARTMENT_SECRETARY,
-  AdminUser.ROLES.SUPER_ADMIN
+  AdminUser.ROLES.DEPARTMENT_HEAD,
 ]), async (req, res) => {
   try {
     const schemeId = req.params.id;
@@ -481,11 +506,12 @@ router.put("/:id/approve", adminAuth, requireRole([
 });
 
 // PUT /api/schemes/:id/reject - Reject a scheme
-// Only Department Head, Department Secretary, or Super Admin can reject
+// Department Head, Department Secretary, Admin, or Super Admin can reject
 router.put("/:id/reject", adminAuth, requireRole([
-  AdminUser.ROLES.DEPARTMENT_HEAD,
+  AdminUser.ROLES.SUPER_ADMIN,
+  AdminUser.ROLES.ADMIN,
   AdminUser.ROLES.DEPARTMENT_SECRETARY,
-  AdminUser.ROLES.SUPER_ADMIN
+  AdminUser.ROLES.DEPARTMENT_HEAD,
 ]), async (req, res) => {
   try {
     const schemeId = req.params.id;

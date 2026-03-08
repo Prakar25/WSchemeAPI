@@ -108,6 +108,8 @@ const schemeSchema = new mongoose.Schema(
     },
     // Per-scheme dynamic form fields - defines extra inputs for this scheme's application form
     // Admin adds/removes these when creating or editing a scheme; applicants fill values in form_data
+    // title = display label; field_key = key in form_data (derived from title: spaces→_)
+    // depends_on = show this field only when parent field has given value (e.g. checkbox checked)
     custom_form_fields: {
       type: [
         {
@@ -116,9 +118,14 @@ const schemeSchema = new mongoose.Schema(
             required: [true, "Field key is required"],
             trim: true,
           },
+          title: {
+            type: String,
+            required: false,
+            trim: true,
+          },
           label: {
             type: String,
-            required: [true, "Label is required"],
+            required: false,
             trim: true,
           },
           field_type: {
@@ -133,7 +140,11 @@ const schemeSchema = new mongoose.Schema(
           options: {
             type: [String],
             default: [],
-          }, // for select type only
+          },
+          depends_on: {
+            field_key: { type: String, trim: true },
+            value: { type: mongoose.Schema.Types.Mixed },
+          },
         },
       ],
       default: [],

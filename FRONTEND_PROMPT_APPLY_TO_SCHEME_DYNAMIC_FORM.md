@@ -28,6 +28,7 @@ Make the scheme application form **dynamic** – driven by `scheme.custom_form_f
   "custom_form_fields": [
     {
       "field_key": "annual_income",
+      "title": "Annual Income (INR)",
       "label": "Annual Income (INR)",
       "field_type": "number",
       "required": true,
@@ -35,10 +36,18 @@ Make the scheme application form **dynamic** – driven by `scheme.custom_form_f
     },
     {
       "field_key": "household_type",
+      "title": "Household Type",
       "label": "Household Type",
       "field_type": "select",
       "required": true,
       "options": ["Nuclear", "Joint", "Extended"]
+    },
+    {
+      "field_key": "which_scheme_name",
+      "title": "Which scheme name?",
+      "field_type": "text",
+      "required": true,
+      "depends_on": { "field_key": "are_you_applying_to_another_scheme", "value": true }
     }
   ],
   "scheme_required_document_types": ["Aadhaar Card", "Income Certificate"],
@@ -46,7 +55,7 @@ Make the scheme application form **dynamic** – driven by `scheme.custom_form_f
 }
 ```
 
-**Note:** API stores `field_type` internally; frontend may receive either `field_type` or `type` (both supported).
+**Note:** Use `title` for display; backend derives `field_key` from title (spaces→_). For dependent fields, use `depends_on: { field_key, value }` – the field shows only when the parent matches. See `docs/CUSTOM_FORM_FIELDS_SPEC.md`.
 
 ### 2. Apply endpoint accepts `form_data`
 
@@ -102,7 +111,8 @@ Delete or replace the 5 static fields in ApplyToScheme.page.jsx:
 
 - If `scheme.custom_form_fields` is empty or missing → show no custom inputs (or a message: "No additional fields required")
 - Otherwise, iterate over `scheme.custom_form_fields` and render one input per field
-- Use `field_key` as the key in `form_data`, `label` for the label, `field_type` (or `type`) for the input type, `required` for validation, and `options` for select dropdowns
+- Use `field_key` as the key in `form_data`, `title` or `label` for the label, `field_type` for input type, `required` for validation
+- **Dependent fields:** Only show a field if it has no `depends_on`, or if `formData[depends_on.field_key] === depends_on.value` (for checkbox, treat true/1/"true"/"yes" as checked)
 
 ### 3. Keep documents section as-is
 
@@ -136,17 +146,30 @@ function ApplyFormFields({ scheme, formData, setFormData }) {
     setFormData(prev => ({ ...prev, [fieldKey]: value }));
   };
 
+  const isVisible = (field) => {
+    const dep = field.depends_on;
+    if (!dep?.field_key) return true;
+    const parentVal = formData[dep.field_key];
+    const target = dep.value;
+    if (field.field_type === "checkbox" || fields.find((f) => f.field_key === dep.field_key)?.field_type === "checkbox") {
+      const checked = parentVal === true || parentVal === 1 || parentVal === "true" || parentVal === "yes";
+      return (target === true || target === 1 || target === "true" || target === "yes") === checked;
+    }
+    return String(parentVal) === String(target);
+  };
+
   return (
     <div>
-      {fields.map((field) => {
+      {fields.filter(isVisible).map((field) => {
         const key = field.field_key;
         const type = field.field_type || field.type || "text";
         const value = formData[key];
+        const label = field.title || field.label || key;
 
         return (
           <div key={key} className="form-group">
             <label>
-              {field.label} {field.required && "*"}
+              {label} {field.required && "*"}
             </label>
             {type === "text" && (
               <input

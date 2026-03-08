@@ -3,6 +3,7 @@ const router = express.Router();
 const AdminUser = require("../models/AdminUser");
 const adminAuth = require("../middleware/adminAuth");
 const { signAdminToken } = require("../utils/jwtUtils");
+const { comparePassword } = require("../utils/passwordUtils");
 
 // POST /api/admin-login
 // Accepts credentials in body or query: { username, password }
@@ -23,7 +24,8 @@ router.post("/", async (req, res) => {
   try {
     const user = await AdminUser.findOne({ username });
 
-    if (!user || user.password !== password) {
+    const passwordMatch = user && (await comparePassword(password, user.password));
+    if (!user || !passwordMatch) {
       return res.status(401).json({
         status: "unauthorized",
         message: "Invalid credentials",

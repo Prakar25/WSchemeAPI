@@ -3,6 +3,7 @@ const router = express.Router();
 const Application = require("../models/Application");
 const Scheme = require("../models/Scheme");
 const PublicUser = require("../models/PublicUser");
+const FraudCheckRun = require("../models/FraudCheckRun");
 const adminAuth = require("../middleware/adminAuth");
 const { checkEligibility } = require("../utils/eligibilityUtils");
 
@@ -294,6 +295,52 @@ router.get("/fraud-alerts", adminAuth, async (req, res) => {
     res.status(500).json({
       status: "error",
       message: "Failed to fetch fraud alerts",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+});
+
+// 4. Fraud check run history (scheduled job results)
+// GET /api/admin/dashboard/fraud-check-runs
+router.get("/fraud-check-runs", adminAuth, async (req, res) => {
+  try {
+    const { limit = 20 } = req.query;
+    const limitNum = Math.min(parseInt(limit, 10) || 20, 100);
+
+    const runs = await FraudCheckRun.find()
+      .sort({ runAt: -1 })
+      .limit(limitNum)
+      .select("runAt duplicatesFound ineligibleFound status errorMessage durationMs alerts");
+
+    res.status(200).json({
+      status: "success",
+      data: { runs },
+    });
+  } catch (error) {
+    console.error("Error fetching fraud check runs:", error);
+    res.status(500).json({
+      status: "error",
+      message: "Failed to fetch fraud check runs",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+});
+
+// 5. Manual fraud check trigger
+// POST /api/admin/dashboard/fraud-check/run
+router.post("/fraud-check/run", adminAuth, async (req, res) => {
+  try {
+    const { runFraudCheck } = require("../jobs/fraudCheck");
+    runFraudCheck();
+    res.status(202).json({
+      status: "success",
+      message: "Fraud check started. Results will be stored in fraud-check-runs.",
+    });
+  } catch (error) {
+    console.error("Error triggering fraud check:", error);
+    res.status(500).json({
+      status: "error",
+      message: "Failed to trigger fraud check",
       error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }

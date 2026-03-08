@@ -34,6 +34,28 @@ app.use(express.urlencoded({ extended: true }));
 // Connect to MongoDB
 connectDB();
 
+// Swagger UI
+const swaggerUi = require("swagger-ui-express");
+const swaggerSpec = require("./config/swagger");
+app.get("/api-docs.json", (req, res) => res.json(swaggerSpec));
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, { explorer: true }));
+
+// Scheduled fraud/redundancy check (4x daily by default)
+const fraudCheckEnabled = process.env.FRAUD_CHECK_ENABLED !== "false";
+if (fraudCheckEnabled) {
+  const cron = require("node-cron");
+  const { runFraudCheck } = require("./jobs/fraudCheck");
+  const schedule = process.env.FRAUD_CHECK_CRON || "0 6,12,18,0 * * *"; // 6am, 12pm, 6pm, midnight
+
+  cron.schedule(schedule, () => {
+    runFraudCheck();
+  });
+
+  if (process.env.FRAUD_CHECK_RUN_ON_START === "true") {
+    runFraudCheck();
+  }
+}
+
 // Routes
 app.get("/", (req, res) => {
   res.json({

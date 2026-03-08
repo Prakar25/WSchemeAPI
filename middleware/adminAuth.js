@@ -8,6 +8,7 @@
 
 const AdminUser = require("../models/AdminUser");
 const { verifyAdminToken } = require("../utils/jwtUtils");
+const { comparePassword } = require("../utils/passwordUtils");
 
 const adminAuth = async (req, res, next) => {
   try {
@@ -47,7 +48,8 @@ const adminAuth = async (req, res, next) => {
         username: username.trim().toLowerCase(),
       });
 
-      if (!admin || admin.password !== password.trim()) {
+      const passwordMatch = admin && (await comparePassword(password.trim(), admin.password));
+      if (!admin || !passwordMatch) {
         return res.status(401).json({
           status: "error",
           message: "Invalid admin credentials",

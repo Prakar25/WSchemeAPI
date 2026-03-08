@@ -30,6 +30,7 @@ router.put("/update", publicUserAuth, async (req, res) => {
       state,
       pincode,
       country,
+      familyDetails,
     } = req.body;
 
     // Update demographics
@@ -105,6 +106,30 @@ router.put("/update", publicUserAuth, async (req, res) => {
     }
     if (country !== undefined) user.address.country = country.trim() || "India";
 
+    // Update family details
+    if (familyDetails !== undefined && Array.isArray(familyDetails)) {
+      const valid = familyDetails.every(
+        (f) =>
+          f &&
+          typeof f === "object" &&
+          typeof f.name === "string" &&
+          f.name.trim() &&
+          typeof f.relationWithApplicant === "string" &&
+          f.relationWithApplicant.trim() &&
+          typeof f.age === "number" &&
+          !Number.isNaN(f.age) &&
+          f.age >= 0
+      );
+      if (valid) {
+        user.familyDetails = familyDetails.map((f) => ({
+          name: String(f.name).trim(),
+          relationWithApplicant: String(f.relationWithApplicant).trim(),
+          age: Number(f.age),
+          occupation: f.occupation != null ? String(f.occupation).trim() : "",
+        }));
+      }
+    }
+
     // Update audit fields
     user.audit.lastUpdated = new Date();
     user.audit.updateCount = (user.audit.updateCount || 0) + 1;
@@ -154,6 +179,7 @@ router.put("/update", publicUserAuth, async (req, res) => {
       dob: user.demographics?.dob?.date || null,
       aadhaarNumber: user.aadhaarNumber || null,
       gender: user.demographics?.gender || null,
+      familyDetails: user.familyDetails || [],
       kycLevel: user.kycLevel,
       documents: user.documents || null,
       verificationStatus: user.status?.verificationStatus || "pending",
@@ -237,6 +263,7 @@ function applyProfileUpdates(user, body) {
     state,
     pincode,
     country,
+    familyDetails,
   } = body;
 
   if (fullName !== undefined && fullName !== "") {
@@ -276,6 +303,36 @@ function applyProfileUpdates(user, body) {
     user.address.pincode = String(pincode).trim();
   }
   if (country !== undefined) user.address.country = String(country).trim() || "India";
+
+  let parsedFamilyDetails = familyDetails;
+  if (typeof familyDetails === "string") {
+    try {
+      parsedFamilyDetails = JSON.parse(familyDetails);
+    } catch {
+      parsedFamilyDetails = [];
+    }
+  }
+  if (parsedFamilyDetails !== undefined && Array.isArray(parsedFamilyDetails)) {
+    const valid = parsedFamilyDetails.every(
+      (f) =>
+        f &&
+        typeof f === "object" &&
+        typeof f.name === "string" &&
+        f.name.trim() &&
+        typeof f.relationWithApplicant === "string" &&
+        f.relationWithApplicant.trim() &&
+        (typeof f.age === "number" || (typeof f.age === "string" && !Number.isNaN(Number(f.age)))) &&
+        Number(f.age) >= 0
+    );
+    if (valid) {
+      user.familyDetails = parsedFamilyDetails.map((f) => ({
+        name: String(f.name).trim(),
+        relationWithApplicant: String(f.relationWithApplicant).trim(),
+        age: Number(f.age),
+        occupation: f.occupation != null ? String(f.occupation).trim() : "",
+      }));
+    }
+  }
 }
 
 function computeKycLevel(user) {
@@ -369,11 +426,12 @@ router.post(
         dob: user.demographics?.dob?.date || null,
         aadhaarNumber: user.aadhaarNumber || null,
         gender: user.demographics?.gender || null,
-      kycLevel: user.kycLevel,
-      documents: user.documents || null,
-      verificationStatus: user.status?.verificationStatus || "pending",
-      accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
-    };
+        familyDetails: user.familyDetails || [],
+        kycLevel: user.kycLevel,
+        documents: user.documents || null,
+        verificationStatus: user.status?.verificationStatus || "pending",
+        accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
+      };
 
     return res.status(200).json({
       status: "success",
@@ -424,6 +482,7 @@ router.get("/", publicUserAuth, async (req, res) => {
       dob: user.demographics?.dob?.date || null,
       aadhaarNumber: user.aadhaarNumber || null,
       gender: user.demographics?.gender || null,
+      familyDetails: user.familyDetails || [],
       kycLevel: user.kycLevel,
       documents: user.documents || null,
       verificationStatus: user.status?.verificationStatus || "pending",
@@ -575,6 +634,7 @@ router.post(
         dob: user.demographics?.dob?.date || null,
         aadhaarNumber: user.aadhaarNumber || null,
         gender: user.demographics?.gender || null,
+        familyDetails: user.familyDetails || [],
         kycLevel: user.kycLevel,
         verificationStatus: user.status?.verificationStatus || "pending",
         accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
@@ -714,6 +774,7 @@ router.post(
       dob: user.demographics?.dob?.date || null,
       aadhaarNumber: user.aadhaarNumber || null,
       gender: user.demographics?.gender || null,
+      familyDetails: user.familyDetails || [],
       kycLevel: user.kycLevel,
       verificationStatus: user.status?.verificationStatus || "pending",
       accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),

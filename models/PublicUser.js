@@ -91,6 +91,17 @@ const publicUserSchema = new mongoose.Schema(
         trim: true,
       },
     },
+    familyDetails: {
+      type: [
+        {
+          name: { type: String, required: true, trim: true },
+          relationWithApplicant: { type: String, required: true, trim: true },
+          age: { type: Number, required: true },
+          occupation: { type: String, required: false, trim: true, default: "" },
+        },
+      ],
+      default: [],
+    },
     contact: {
       mobile: {
         value: {

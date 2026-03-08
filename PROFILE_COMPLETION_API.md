@@ -48,6 +48,7 @@ Use this when the user fills the whole form and presses **one Submit** button. S
 | locality, district, state | string | No | Address |
 | pincode | string | No | 6-digit pincode |
 | country | string | No | Default India |
+| familyDetails | string (JSON) | No | JSON string of array: `[{ name, relationWithApplicant, age, occupation }]` |
 | aadhaarCard | file | No | Aadhaar card image/PDF |
 | birthCertificate | file | No | Birth certificate image/PDF |
 | certificateOfIdentification | file | No | Certificate of identification image/PDF |
@@ -184,11 +185,16 @@ Include `userId` in query when submitting (e.g. from JS). Form fields: same name
   "district": "East Sikkim",
   "state": "Sikkim",
   "pincode": "737101",
-  "country": "India"
+  "country": "India",
+  "familyDetails": [
+    { "name": "Jane Doe", "relationWithApplicant": "Spouse", "age": 35, "occupation": "Teacher" }
+  ]
 }
 ```
 
 **Note:** All fields are optional. Only include fields you want to update.
+
+**familyDetails** (optional): Array of family members. Each object: `name` (required), `relationWithApplicant` (required), `age` (required, number), `occupation` (optional).
 
 **Field Descriptions:**
 - `aadhaarNumber`: 12-digit Aadhaar number (optional)

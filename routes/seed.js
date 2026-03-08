@@ -4,6 +4,7 @@ const mongoose = require("mongoose");
 const crypto = require("crypto");
 const AdminUser = require("../models/AdminUser");
 const PublicUser = require("../models/PublicUser");
+const { hashPassword } = require("../utils/passwordUtils");
 
 // Helper function to generate aadhaar hash
 const generateAadhaarHash = (aadhaarNumber) => {
@@ -313,8 +314,14 @@ router.post("/", async (req, res) => {
       // Continue anyway - indexes might not exist
     }
 
-    // Insert admin users
-    const insertedAdminUsers = await AdminUser.insertMany(adminUsers);
+    // Insert admin users (hash passwords before insert)
+    const adminUsersWithHashedPasswords = await Promise.all(
+      adminUsers.map(async (u) => ({
+        ...u,
+        password: await hashPassword(u.password),
+      }))
+    );
+    const insertedAdminUsers = await AdminUser.insertMany(adminUsersWithHashedPasswords);
 
     // Insert public users
     const insertedPublicUsers = await PublicUser.insertMany(publicUsers);

@@ -22,10 +22,25 @@ function validateFormData(formData, customFormFields) {
   const fieldMap = {};
   customFormFields.forEach((f) => { fieldMap[f.field_key] = f; });
 
+  function isParentSatisfied(field, formData) {
+    const dep = field.depends_on;
+    if (!dep || !dep.field_key) return true;
+    const parentValue = formData && formData[dep.field_key];
+    const targetValue = dep.value;
+    if (field.field_type === "checkbox" || fieldMap[dep.field_key]?.field_type === "checkbox") {
+      const parentBool = parentValue === true || parentValue === 1 || parentValue === "true" || parentValue === "yes";
+      const targetBool = targetValue === true || targetValue === 1 || targetValue === "true" || targetValue === "yes";
+      return parentBool === targetBool;
+    }
+    return String(parentValue) === String(targetValue);
+  }
+
   for (const field of customFormFields) {
+    if (!isParentSatisfied(field, formData)) continue;
+
     const key = field.field_key;
     const type = field.field_type || field.type || "text";
-    const label = field.label || key;
+    const label = field.title || field.label || key;
     const value = formData && formData[key];
 
     // Required check

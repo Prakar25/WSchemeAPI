@@ -1,8 +1,15 @@
 /**
  * OTP Service
- * Handles OTP generation, storage, and verification
- * For production, integrate with SMS service provider (e.g., Twilio, AWS SNS, etc.)
+ * Handles OTP generation, storage, verification, and SMS sending via ThunderSMS
  */
+
+const axios = require("axios");
+const https = require("https");
+
+const WEBSITE_NAME = "Himalayan Creators";
+
+// HTTPS agent for ThunderSMS (some servers have cert issues)
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 // In-memory OTP store (for development)
 // In production, consider using Redis or database for OTP storage
@@ -104,28 +111,62 @@ const verifyOTP = (mobileNumber, otp, purpose = 'register') => {
 };
 
 /**
- * Send OTP via SMS (placeholder - integrate with SMS service)
- * @param {string} mobileNumber - Mobile number
+ * Send OTP via ThunderSMS (when configured) or log only
+ * Always logs OTP to console for debugging
+ * @param {string} mobileNumber - Mobile number (10 digits)
  * @param {string} otp - OTP code
  * @param {string} purpose - Purpose: 'register' or 'login'
  * @returns {Promise<boolean>} - Success status
  */
-const sendOTP = async (mobileNumber, otp, purpose = 'register') => {
-  // TODO: Integrate with SMS service provider (Twilio, AWS SNS, etc.)
-  // For now, just log it (in development)
-  console.log(`[OTP Service] OTP for ${mobileNumber} (${purpose}): ${otp}`);
-  
-  // In production, implement actual SMS sending:
-  // Example with Twilio:
-  // const client = require('twilio')(accountSid, authToken);
-  // await client.messages.create({
-  //   body: `Your OTP for ${purpose === 'register' ? 'registration' : 'login'} is ${otp}. Valid for 10 minutes.`,
-  //   to: mobileNumber,
-  //   from: '+1234567890'
-  // });
+const sendOTP = async (mobileNumber, otp, purpose = "register") => {
+  const reason = purpose === "register" ? "Registration" : "Login";
 
-  // For development, return true
-  return true;
+  // Always log OTP to terminal for debugging
+  console.log(`[OTP] ${mobileNumber} (${purpose}): ${otp}`);
+
+  const smsUser = process.env.THUNDER_SMS_USER || process.env.THUNDER_SMS_MOBILE_NO;
+  const hasThunderConfig =
+    smsUser &&
+    process.env.THUNDER_SMS_API_KEY &&
+    process.env.THUNDER_SMS_SENDER_ID &&
+    process.env.THUNDER_SMS_TEMPLATE_ID &&
+    process.env.THUNDER_SMS_PE_ID;
+
+  if (!hasThunderConfig) {
+    console.log(`[OTP] ThunderSMS not configured. Add THUNDER_SMS_* env vars to send real SMS.`);
+    return true;
+  }
+
+  try {
+    // newportal push API - message must match DLT template exactly
+    const context = reason === "Registration" ? "Registration Portal" : "Login Portal";
+    const msgtxt = `${otp} is your OTP to ${context}. Kindly keep this confidential for security purposes. -HYN Hive`;
+
+    const params = {
+      username: smsUser,
+      signature: process.env.THUNDER_SMS_SENDER_ID,
+      apikey: process.env.THUNDER_SMS_API_KEY,
+      msgtxt,
+      msgtype: "PM",
+      dest: mobileNumber,
+      entityid: process.env.THUNDER_SMS_PE_ID,
+      templateid: process.env.THUNDER_SMS_TEMPLATE_ID,
+    };
+
+    const required = ["username", "signature", "apikey", "msgtxt", "msgtype", "dest", "entityid", "templateid"];
+    console.log("[OTP] ThunderSMS (newportal) params:", required.map((k) => `${k}=${k === "apikey" ? "***" : params[k]}`).join(", "));
+
+    const sendRes = await axios.get("https://newportal.thundersms.com/pushapi/sendmsg", {
+      params,
+      httpsAgent,
+    });
+
+    console.log("[OTP] ThunderSMS response:", JSON.stringify(sendRes.data));
+    return true;
+  } catch (error) {
+    console.error("[OTP] ThunderSMS error:", error.message);
+    return false;
+  }
 };
 
 /**

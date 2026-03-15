@@ -698,20 +698,8 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     const useSchemeWorkflow = authorizationLevels.length > 0;
     
     // Get required role levels for current verification level
-    // Level 9 (CSD Admin) is always handled by CSD Admin, regardless of scheme workflow
-    let requiredRoleLevels = [];
-    if (currentLevel === 9) {
-      requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(9); // [9] - CSD Admin only
-    } else if (useSchemeWorkflow) {
-      // For scheme-specific workflow, check if current level matches the expected level at current index
-      if (authorizationLevelIndex < authorizationLevels.length) {
-        const expectedLevel = authorizationLevels[authorizationLevelIndex];
-        requiredRoleLevels = [expectedLevel];
-      }
-    } else {
-      // Use default workflow logic
-      requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
-    }
+    // Who can verify is determined by the current verification_level (stage), not by scheme index
+    let requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
     
     // Check if admin can verify at this level
     const canVerify = requiredRoleLevels.includes(adminRoleLevel);
@@ -727,13 +715,22 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
           nextLevel = 7;
           nextAuthorizationLevelIndex = 0;
         } else if (useSchemeWorkflow) {
-          // Move to next level in authorization_levels array
-          nextAuthorizationLevelIndex = authorizationLevelIndex + 1;
-          if (nextAuthorizationLevelIndex < authorizationLevels.length) {
-            nextLevel = authorizationLevels[nextAuthorizationLevelIndex];
-          } else {
-            // Reached end of authorization levels - mark as completed
-            nextLevel = 99; // Completed
+          // Flow in REVERSE order: 7 → auth[last] → auth[last-1] → ... → auth[0] → 99
+          // [3, 4, 8] means 8 first, then 4, then 3 (reverse of array order)
+          // Skip 7→8: both are Post Operator, so go 7→4 (Department) directly
+          if (authorizationLevelIndex < authorizationLevels.length) {
+            let reverseIndex = authorizationLevels.length - 1 - authorizationLevelIndex;
+            nextLevel = authorizationLevels[reverseIndex];
+            nextAuthorizationLevelIndex = authorizationLevelIndex + 1;
+            // If at 7 and next is 8 (same stage), skip to next distinct level
+            if (currentLevel === 7 && nextLevel === 8 && nextAuthorizationLevelIndex < authorizationLevels.length) {
+              reverseIndex = authorizationLevels.length - 1 - nextAuthorizationLevelIndex;
+              nextLevel = authorizationLevels[reverseIndex];
+              nextAuthorizationLevelIndex++;
+            }
+          }
+          if (nextLevel === null || nextAuthorizationLevelIndex > authorizationLevels.length) {
+            nextLevel = 99;
           }
         } else {
           // Use default workflow: 9 -> 7 -> 6 -> 3 -> Completed
@@ -749,13 +746,16 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
         }
       } else if (action === "Returned") {
         if (useSchemeWorkflow) {
-          // Return to previous level in authorization_levels array
-          if (authorizationLevelIndex > 0) {
+          // Return one step (reverse order): at index 1 go back to 7; at index 2 go to auth[last-1]; etc.
+          if (authorizationLevelIndex > 1) {
             nextAuthorizationLevelIndex = authorizationLevelIndex - 1;
-            nextLevel = authorizationLevels[nextAuthorizationLevelIndex];
+            const reverseIndex = authorizationLevels.length - 1 - (authorizationLevelIndex - 1);
+            nextLevel = authorizationLevels[reverseIndex];
+          } else if (authorizationLevelIndex === 1) {
+            nextAuthorizationLevelIndex = 0;
+            nextLevel = 7; // Back to Post Operator
           } else {
-            // Already at first level, can't go back
-            nextLevel = currentLevel;
+            nextLevel = currentLevel; // Already at 7, can't go back
           }
         } else {
           // Use default workflow for returns: 3 -> 6 -> 7/8 -> 9 -> (can't go back)
@@ -784,11 +784,23 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
       });
     }
 
-    // Handle rejection - already handled above with nextLevel logic
+    // Handle rejection: reset to first stage (Post Operator) so applicant can revise and re-submit
     if (action === "Rejected") {
       application.status = "Rejected";
-      application.verification_level = 99; // Completed
-      application.verification_stage = "Completed"; // Legacy
+      application.verification_level = 7; // Post Operator - first stage after CSD Admin
+      application.verification_stage = "Post_Operator_Review";
+      application.authorization_level_index = 0;
+      application.current_verifier = {
+        verified_by: null,
+        verified_by_name: null,
+        verified_by_role: null,
+        verified_by_role_level: null,
+        remarks: null,
+        verified_at: null,
+      };
+    } else if (nextLevel === 99) {
+      // Verification completed successfully - set status to Approved
+      application.status = "Approved";
     }
 
     // Add to verification history
@@ -804,8 +816,10 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
       verified_at: new Date(),
     });
 
-    // Update current verifier
-    if (nextLevel !== null && nextLevel !== 99) {
+    // Update current verifier (skip for Rejected - already cleared above)
+    if (action === "Rejected") {
+      // current_verifier already set in Rejected block
+    } else if (nextLevel !== null && nextLevel !== 99) {
       // If forward_to_admin_id is provided, assign to that specific admin
       // If not provided, application moves to next level without specific assignment
       if (forward_to_admin_id && (action === "Verified" || action === "Forwarded")) {

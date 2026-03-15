@@ -12,6 +12,30 @@ function titleToFieldKey(title) {
     .replace(/[^a-z0-9_]/g, "");
 }
 
+// Normalize scheme_eligibility.custom_fields - form-style (label, type, required, options)
+function normalizeEligibilityCustomFields(fields) {
+  if (!Array.isArray(fields)) return [];
+  return fields.map((f, i) => {
+    const title = f.title ?? f.label ?? "";
+    const field_key =
+      f.field_key && String(f.field_key).trim()
+        ? String(f.field_key).trim().toLowerCase().replace(/\s+/g, "_")
+        : titleToFieldKey(title) || `field_${i}`;
+    let options = f.options;
+    if (typeof options === "string") options = options.split(",").map((s) => s.trim()).filter(Boolean);
+    return {
+      field_key,
+      title: title || field_key,
+      label: title || field_key,
+      field_type: ["text", "number", "select", "date", "textarea", "checkbox"].includes(f.field_type ?? f.type)
+        ? (f.field_type ?? f.type)
+        : "text",
+      required: !!f.required,
+      options: Array.isArray(options) ? options : [],
+    };
+  });
+}
+
 // Normalize custom_form_fields: accepts title (display) or label, derives field_key from title
 // Multiple fields are stored. Supports depends_on for conditional/sub-fields.
 function normalizeCustomFormFields(fields) {
@@ -229,6 +253,11 @@ router.post("/", async (req, res) => {
     if (schemeData.custom_form_fields !== undefined) {
       schemeData.custom_form_fields = normalizeCustomFormFields(schemeData.custom_form_fields);
     }
+    if (schemeData.scheme_eligibility && schemeData.scheme_eligibility.custom_fields !== undefined) {
+      schemeData.scheme_eligibility.custom_fields = normalizeEligibilityCustomFields(
+        schemeData.scheme_eligibility.custom_fields
+      );
+    }
 
     // Create new scheme
     const scheme = await Scheme.create(schemeData);
@@ -276,6 +305,11 @@ router.post("/update", async (req, res) => {
     // Update the scheme fields
     if (updateData.custom_form_fields !== undefined) {
       updateData.custom_form_fields = normalizeCustomFormFields(updateData.custom_form_fields);
+    }
+    if (updateData.scheme_eligibility && updateData.scheme_eligibility.custom_fields !== undefined) {
+      updateData.scheme_eligibility.custom_fields = normalizeEligibilityCustomFields(
+        updateData.scheme_eligibility.custom_fields
+      );
     }
     Object.keys(updateData).forEach((key) => {
       if (updateData[key] !== undefined) {

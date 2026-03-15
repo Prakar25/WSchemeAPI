@@ -60,6 +60,24 @@ const schemeSchema = new mongoose.Schema(
         type: Number,
         required: [true, "Upper age limit is required"],
       },
+      // Informative form field definitions (label, type, required, options) - NOT used for eligibility checks
+      custom_fields: {
+        type: [
+          {
+            field_key: { type: String, trim: true },
+            title: { type: String, trim: true },
+            label: { type: String, trim: true },
+            field_type: {
+              type: String,
+              enum: ["text", "number", "select", "date", "textarea", "checkbox"],
+              default: "text",
+            },
+            required: { type: Boolean, default: false },
+            options: { type: [String], default: [] },
+          },
+        ],
+        default: [],
+      },
     },
     scheme_required_document_types: {
       type: [String],

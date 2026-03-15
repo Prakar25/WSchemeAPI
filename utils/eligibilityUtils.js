@@ -77,6 +77,9 @@ async function checkEligibility(user, scheme, userId = null) {
     }
   }
 
+  // Note: scheme_eligibility.custom_fields are informative (form field definitions), not used for eligibility
+  // Only age (and income_limit, economic_category if present) are checked above
+
   // Check excluded schemes - if user has applied to any excluded scheme, they're ineligible
   if (scheme.excluded_schemes && scheme.excluded_schemes.length > 0 && userId) {
     const excludedCheck = await hasAppliedToExcludedSchemes(userId, scheme.excluded_schemes);

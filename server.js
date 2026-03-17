@@ -76,13 +76,29 @@ app.get("/api/health", (req, res) => {
 
 // API Routes (to be expanded)
 app.use("/api", require("./routes/index"));
+// Compatibility: some reverse proxies strip the `/api` prefix before forwarding.
+// Mounting the same router at root allows both `/api/...` and `/<route>` to work.
+app.use("/", require("./routes/index"));
 
 // File upload to server code - mount under /api to match frontend
 app.use("/api/upload", require("./routes/uploadFileToServer"));
+app.use("/upload", require("./routes/uploadFileToServer"));
 
 // File delete from server code
 app.use(
   "/api/deleteFile",
+  (req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "http://localhost:5173");
+    res.header("Access-Control-Allow-Credentials", "true");
+    res.header("Cross-Origin-Resource-Policy", "cross-origin");
+    res.header("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    next();
+  },
+  deleteFileFromServer
+);
+app.use(
+  "/deleteFile",
   (req, res, next) => {
     res.header("Access-Control-Allow-Origin", "http://localhost:5173");
     res.header("Access-Control-Allow-Credentials", "true");

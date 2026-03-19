@@ -312,6 +312,9 @@ router.get("/", adminAuth, async (req, res) => {
       const appObj = app.toObject();
       return {
         ...appObj,
+        // Alias for admin UI convenience
+        documents_submitted: appObj.documents_submitted || [],
+        documents: appObj.documents_submitted || [],
         applicantName: app.user_id?.demographics?.fullName || "Unknown",
         applicantId: app.user_id?._id || null,
         schemeName: app.scheme_id?.scheme_name || "Unknown",
@@ -378,6 +381,9 @@ router.get("/scheme/:scheme_id", async (req, res) => {
         status: appObj.status || "",
         date_applied: appObj.date_applied || appObj.createdAt,
         verification_stage: verificationStage,
+        // Include submitted documents for admin view
+        documents_submitted: appObj.documents_submitted || [],
+        documents: appObj.documents_submitted || [],
       };
     });
 
@@ -457,6 +463,9 @@ router.get("/:id", adminAuth, async (req, res) => {
       applicantId: application.user_id?._id || null,
       schemeName: application.scheme_id?.scheme_name || "Unknown",
       schemeId: application.scheme_id?._id || null,
+      // Alias for admin UI convenience
+      documents_submitted: appObj.documents_submitted || [],
+      documents: appObj.documents_submitted || [],
       verification_level: currentLevel,
       verification_stage: ApplicationModel.getStageNameFromLevel(currentLevel),
       required_role_levels: requiredRoleLevels,
@@ -937,6 +946,9 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
       applicantGender: updatedApplication.user_id?.demographics?.gender || null,
       schemeName: updatedApplication.scheme_id?.scheme_name || "Unknown",
       schemeId: updatedApplication.scheme_id?._id || null,
+      // Alias for admin UI convenience
+      documents_submitted: appObj.documents_submitted || [],
+      documents: appObj.documents_submitted || [],
       verification_level: updatedApplication.verification_level || 7,
       verification_stage: ApplicationModel.getStageNameFromLevel(updatedApplication.verification_level || 7),
     };
@@ -1428,7 +1440,10 @@ router.put("/:applicationId/approve", adminAuth, async (req, res) => {
     res.status(200).json({
       status: "success",
       message: "Application approved successfully",
-      data: updatedApplication,
+      data: {
+        ...updatedApplication.toObject(),
+        documents: updatedApplication.documents_submitted || [],
+      },
     });
   } catch (error) {
     console.error("Error approving application:", error);
@@ -1584,7 +1599,10 @@ router.post("/:applicationId/forward", adminAuth, async (req, res) => {
     res.status(200).json({
       status: "success",
       message: `Application forwarded to ${targetAdmin.fullName} successfully`,
-      data: updatedApplication,
+      data: {
+        ...updatedApplication.toObject(),
+        documents: updatedApplication.documents_submitted || [],
+      },
     });
   } catch (error) {
     console.error("Error forwarding application:", error);
@@ -1689,7 +1707,10 @@ router.put("/:applicationId/reject", adminAuth, async (req, res) => {
     res.status(200).json({
       status: "success",
       message: "Application rejected successfully",
-      data: updatedApplication,
+      data: {
+        ...updatedApplication.toObject(),
+        documents: updatedApplication.documents_submitted || [],
+      },
     });
   } catch (error) {
     console.error("Error rejecting application:", error);

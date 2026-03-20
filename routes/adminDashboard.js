@@ -27,22 +27,39 @@ router.get("/statistics", adminAuth, async (req, res) => {
     let pending = 0;
     let rejected = 0;
 
-    // Map status values to counts
+    // Map status values to counts (use += to accumulate, not overwrite)
     stats.forEach((stat) => {
       const status = stat._id?.toLowerCase();
+      const count = stat.count || 0;
       if (status === "approved") {
-        approved = stat.count;
-      } else if (status === "pending" || status === "applied" || status === "under review") {
-        // For KPI cards: treat Applied + Under Review as "pending"
-        pending = stat.count;
+        approved += count;
+      } else if (
+        status === "pending" ||
+        status === "applied" ||
+        status === "under review" ||
+        status === "bioauthentication"
+      ) {
+        pending += count;
       } else if (status === "rejected") {
-        rejected = stat.count;
+        rejected += count;
       }
     });
 
     // Get total unique applicants (count distinct user_ids)
     const uniqueApplicants = await Application.distinct("user_id");
     totalApplicants = uniqueApplicants.length;
+
+    // CSC bio-auth related counts (backend aggregation for frontend "CSC Bio-auth Pending" card)
+    // "CSC review" = verification_level in [5,9] (option A: stage-based, not CSD pending logic)
+    const [bioauthenticationCount, cscReviewCount] = await Promise.all([
+      Application.countDocuments({ status: "Bioauthentication" }),
+      Application.countDocuments({
+        verification_level: { $in: [5, 9] },
+        status: { $nin: ["Approved", "Rejected"] },
+      }),
+    ]);
+    // Combined: CSC Bio-auth Pending = Bioauthentication + CSC Admin Review (same set; Bioauth is subset of CSC)
+    const cscBioauthPendingCount = cscReviewCount;
 
     res.status(200).json({
       status: "success",
@@ -51,6 +68,9 @@ router.get("/statistics", adminAuth, async (req, res) => {
         approved: approved,
         pending: pending,
         rejected: rejected,
+        bioauthentication_count: bioauthenticationCount,
+        csc_review_count: cscReviewCount,
+        csc_bioauth_pending_count: cscBioauthPendingCount,
       },
     });
   } catch (error) {
@@ -130,7 +150,12 @@ router.get("/scheme-beneficiaries", adminAuth, async (req, res) => {
 
         if (status === "approved") {
           schemeStat.approved = count;
-        } else if (status === "pending" || status === "applied" || status === "under review") {
+        } else if (
+          status === "pending" ||
+          status === "applied" ||
+          status === "under review" ||
+          status === "bioauthentication"
+        ) {
           // Treat Applied + Under Review as "pending" for dashboard counts.
           schemeStat.pending = count;
         } else if (status === "rejected") {
@@ -232,7 +257,7 @@ router.get("/fraud-alerts", adminAuth, async (req, res) => {
     if (type === "all" || type === "ineligible") {
       // Get all applications with their user and scheme data
       const applications = await Application.find({
-        status: { $in: ["Applied", "Under Review", "Pending"] },
+        status: { $in: ["Applied", "Under Review", "Pending", "Bioauthentication"] },
       })
         .populate("user_id", "demographics economicStatus")
         .populate("scheme_id", "scheme_name scheme_eligibility gender excluded_schemes")
@@ -467,26 +492,23 @@ router.get("/analytics/stage-breakdown", adminAuth, async (req, res) => {
       { $group: { _id: "$verification_level", count: { $sum: 1 } } },
     ]);
 
-    // Map verification levels to the UI-friendly stage names
+    // Map verification levels to stage names (sequential levels 1-5)
+    // Stage order follows role hierarchy: CSC→District Overlookers→DistrictHQ Head→Admin→Completed
     const stageOrder = [
       "Applied",
-      "CSD_Admin_Review",
-      "Post_Operator_Review",
-      "Admin_Review",
+      "CSC_Admin_Review",
+      "District_Overlookers_Review",
       "District_Head_Review",
-      "Department_Review",
-      "Secretary_Review",
+      "Admin_Review",
       "Completed",
     ];
 
     const stageKeyByStage = {
       Applied: "Level_0",
-      CSD_Admin_Review: "Level_9_Review",
-      Post_Operator_Review: "Level_7_8_Review",
+      CSC_Admin_Review: "Level_5_Review",
+      District_Overlookers_Review: "Level_4_Review",
       Admin_Review: "Level_1_2_Review",
-      District_Head_Review: "Level_6_Review",
-      Department_Review: "Level_4_5_Review",
-      Secretary_Review: "Level_3_Review",
+      District_Head_Review: "Level_3_Review",
       Completed: "Level_99_Review",
     };
 

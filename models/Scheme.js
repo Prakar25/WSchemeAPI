@@ -168,18 +168,21 @@ const schemeSchema = new mongoose.Schema(
       default: [],
     },
     // Authorization levels for the scheme (in order of authorization flow)
-    // Based on ADMIN_ROLES_ENUM.md: 8=Super Admin, 7=Admin, 6=Department Secretary, 
-    // 5=Department Head, 4=Department User, 3=DistrictHQ Head, 2=District Overlookers, 1=Post Operator
+    // Sequential: 1=Super Admin, 2=Admin, 3=DistrictHQ Head, 4=District Overlookers (CSCAdmin/5 excluded)
     authorization_levels: {
       type: [Number],
       required: false,
       default: [],
       validate: {
         validator: function(v) {
-          // Must be an array of numbers between 1-8
-          return Array.isArray(v) && v.every(level => Number.isInteger(level) && level >= 1 && level <= 8);
+          // Must use only allowed role levels for scheme workflow (sequential 1-4):
+          // 1=Super Admin, 2=Admin, 3=DistrictHQ Head, 4=District Overlookers (CSCAdmin/5 excluded)
+          return (
+            Array.isArray(v) &&
+            v.every((level) => Number.isInteger(level) && [1, 2, 3, 4].includes(level))
+          );
         },
-        message: "Authorization levels must be an array of integers between 1 and 8"
+        message: "Authorization levels must be an array of integers from [1, 2, 3, 4]"
       }
     },
     // Approval status for scheme creation

@@ -3,7 +3,7 @@
  * 
  * This script will:
  * 1. Find all admin users without role field
- * 2. Add default role "Post Operator" to them
+ * 2. Add default role "District Overlookers" to them
  * 3. Add isActive: true to users without it
  * 
  * Usage: node scripts/migrateAdminUsers.js
@@ -32,9 +32,9 @@ async function migrateAdminUsers() {
 
       // Check if role is missing
       if (!admin.role) {
-        updates.role = AdminUser.ROLES.POST_OPERATOR;
+        updates.role = AdminUser.ROLES.DISTRICT_OVERLOOKERS;
         needsUpdate = true;
-        console.log(`  📝 Adding default role "Post Operator" to: ${admin.fullName}`);
+        console.log(`  📝 Adding default role "District Overlookers" to: ${admin.fullName}`);
       }
 
       // Check if isActive is missing

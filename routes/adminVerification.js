@@ -5,20 +5,41 @@ const Department = require("../models/Department");
 const adminAuth = require("../middleware/adminAuth");
 
 /**
- * Require Super Admin or Department Secretary to access
+ * GET /api/admin/me - Current admin's role and basic info (from JWT/session)
+ * Use for "who am I" / access checks without full profile fetch
+ */
+router.get("/me", adminAuth, (req, res) => {
+  res.status(200).json({
+    status: "success",
+    admin: {
+      _id: req.admin._id,
+      username: req.admin.username,
+      fullName: req.admin.fullName,
+      role: req.admin.role,
+      roleLevel: req.admin.roleLevel,
+      department: req.admin.department || null,
+      departmentId: req.admin.departmentId || null,
+    },
+    role: req.admin.role,
+    roleLevel: req.admin.roleLevel,
+  });
+});
+
+/**
+ * Require Super Admin or DistrictHQ Head to access
  */
 const requireVerifier = (req, res, next) => {
   const role = req.admin?.role;
   const level = req.admin?.roleLevel;
   if (
     role === AdminUser.ROLES.SUPER_ADMIN ||
-    role === AdminUser.ROLES.DEPARTMENT_SECRETARY
+    role === AdminUser.ROLES.DISTRICTHQ_HEAD
   ) {
     return next();
   }
   return res.status(403).json({
     status: "error",
-    message: "Only Super Admin or Department Secretary can verify pending admins",
+    message: "Only Super Admin or DistrictHQ Head can verify pending admins",
   });
 };
 

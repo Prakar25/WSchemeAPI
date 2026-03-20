@@ -119,7 +119,9 @@ const verifyOTP = (mobileNumber, otp, purpose = 'register') => {
  * @returns {Promise<boolean>} - Success status
  */
 const sendOTP = async (mobileNumber, otp, purpose = "register") => {
-  const reason = purpose === "register" ? "Registration" : "Login";
+  let reason = "Login";
+  if (purpose === "register") reason = "Registration";
+  else if (purpose.startsWith("application_complete")) reason = "Application Approval";
 
   // Always log OTP to terminal for debugging
   console.log(`[OTP] ${mobileNumber} (${purpose}): ${otp}`);
@@ -139,7 +141,12 @@ const sendOTP = async (mobileNumber, otp, purpose = "register") => {
 
   try {
     // newportal push API - message must match DLT template exactly
-    const context = reason === "Registration" ? "Registration Portal" : "Login Portal";
+    const contextMap = {
+      Registration: "Registration Portal",
+      Login: "Login Portal",
+      "Application Approval": "Application Approval Portal",
+    };
+    const context = contextMap[reason] || "Login Portal";
     const msgtxt = `${otp} is your OTP to ${context}. Kindly keep this confidential for security purposes. -HYN Hive`;
 
     const params = {

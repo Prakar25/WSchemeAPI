@@ -52,16 +52,16 @@ router.get("/hierarchy", async (req, res) => {
         role: role,
         level: level,
         displayName: role,
-        isHigherAuthority: level <= 4, // Department Head and above
+        isHigherAuthority: level <= 3, // DistrictHQ Head and above
       }))
       .sort((a, b) => a.level - b.level);
 
-    // Group by authority level
+    // Group by authority level (sequential 1-5)
     const grouped = {
       highest: hierarchy.filter((r) => r.level <= 2), // Super Admin, Admin
-      high: hierarchy.filter((r) => r.level >= 3 && r.level <= 4), // Department Secretary, Department Head
-      medium: hierarchy.filter((r) => r.level === 5), // DistrictHQ Head
-      standard: hierarchy.filter((r) => r.level >= 6), // Department User and below
+      high: hierarchy.filter((r) => r.level === 3), // DistrictHQ Head
+      medium: hierarchy.filter((r) => r.level === 4), // District Overlookers
+      standard: hierarchy.filter((r) => r.level === 5), // CSCAdmin
     };
 
     res.status(200).json({

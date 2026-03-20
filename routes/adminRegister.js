@@ -46,7 +46,7 @@ router.get("/options", async (req, res) => {
  * POST /api/admin-register
  * Register a new admin. Account starts as "pending" until Super Admin or Secretary verifies.
  *
- * Body: username, password, fullName, email, contactNumber (optional), roleLevel (2-9), departmentId (optional)
+ * Body: username, password, fullName, email, contactNumber (optional), roleLevel (2-5), departmentId (optional)
  */
 router.post("/", async (req, res) => {
   try {
@@ -112,11 +112,11 @@ router.post("/", async (req, res) => {
     if (
       Number.isNaN(roleLevelNum) ||
       roleLevelNum < 2 ||
-      roleLevelNum > 9
+      roleLevelNum > 5
     ) {
       return res.status(400).json({
         status: "error",
-        message: "roleLevel must be an integer between 2 and 9",
+        message: "roleLevel must be an integer between 2 and 5",
       });
     }
 

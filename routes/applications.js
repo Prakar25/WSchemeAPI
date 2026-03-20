@@ -6,6 +6,7 @@ const PublicUser = require("../models/PublicUser");
 const AdminUser = require("../models/AdminUser");
 const { checkEligibility } = require("../utils/eligibilityUtils");
 const adminAuth = require("../middleware/adminAuth");
+const { requestOTP, verifyOTP } = require("../utils/otpService");
 
 /**
  * Validate form_data against scheme.custom_form_fields.
@@ -106,6 +107,25 @@ function validateFormData(formData, customFormFields) {
   };
 }
 
+/**
+ * Map legacy workflow levels to sequential (1-4 for scheme auth, 1-5 for verification).
+ * Used for authorization_levels: preserve 1,2,3,4; only map legacy 5,6,7,8,9.
+ * - 1,2,3,4 -> unchanged (scheme authorization_levels)
+ * - 5 (legacy) -> 3
+ * - 6 (legacy) -> 3
+ * - 7,8 (legacy) -> 4
+ * - 9 (legacy) -> 5
+ */
+function mapOldAuthorizationLevelToNew(level) {
+  const n = typeof level === "string" ? parseInt(level, 10) : level;
+  if (!Number.isInteger(n)) return null;
+  if ([1, 2, 3, 4].includes(n)) return n; // Scheme auth levels - never map these
+  if (n === 8 || n === 7) return 4;
+  if (n === 6 || n === 5) return 3;
+  if (n === 9) return 5;
+  return n;
+}
+
 // POST /api/applications/apply - Apply to a scheme
 // Universal rule: only public users with verificationStatus === "verified" can apply; others get 403
 router.post("/apply", async (req, res) => {
@@ -136,7 +156,7 @@ router.post("/apply", async (req, res) => {
         message:
           verificationStatus === "rejected"
             ? "Your account verification was rejected. You cannot apply to schemes. Please contact support."
-            : "You must complete verification before applying to schemes. Please visit a CSDAdmin for bio-authentication. You can view schemes in the meantime.",
+            : "You must complete verification before applying to schemes. Please visit a CSCAdmin for bio-authentication. You can view schemes in the meantime.",
         verificationStatus,
       });
     }
@@ -189,10 +209,12 @@ router.post("/apply", async (req, res) => {
     const sanitizedFormData = validation.sanitizedFormData;
 
     // Get authorization levels from scheme (workflow sequence)
-    const authorizationLevels = scheme.authorization_levels || [];
+    const authorizationLevels = (scheme.authorization_levels || [])
+      .map(mapOldAuthorizationLevelToNew)
+      .filter((v) => v === 1 || v === 2 || v === 3 || v === 4);
 
-    // Applications ALWAYS start at CSD Admin (level 9) first
-    let initialVerificationLevel = 9;
+    // Applications ALWAYS start at CSC Admin (level 5) first
+    let initialVerificationLevel = 5;
     let authorizationLevelIndex = 0;
 
     // Create application - starts at first authorization level or default
@@ -204,7 +226,7 @@ router.post("/apply", async (req, res) => {
       scheme_id,
       status: "Applied",
       verification_level: initialVerificationLevel,
-      verification_stage: ApplicationModel.getStageNameFromLevel(initialVerificationLevel), // Legacy field
+      verification_stage: ApplicationModel.getStageNameFromLevel(initialVerificationLevel),
       authorization_levels: authorizationLevels, // Store the workflow sequence
       authorization_level_index: authorizationLevelIndex, // Start at first level
       form_data: sanitizedFormData,
@@ -245,17 +267,153 @@ router.post("/apply", async (req, res) => {
   }
 });
 
+/**
+ * POST /api/applications/bioauthentication/queue
+ * Admin can shift selected applications to CSC for re-bioauthentication.
+ * Body: { applicationIds: string[] }
+ *
+ * What it does:
+ * - Sets Application.status = "Bioauthentication"
+ * - Resets verification back to CSC Admin Review (verification_level = 5)
+ * - Resets associated PublicUser verificationStatus to "pending" so CSCAdmin can re-verify bio-auth
+ */
+router.post("/bioauthentication/queue", adminAuth, async (req, res) => {
+  try {
+    const { applicationIds } = req.body;
+    const admin = req.admin;
+
+    const ids = Array.isArray(applicationIds) ? applicationIds : [];
+    if (ids.length === 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "applicationIds (non-empty array) is required",
+      });
+    }
+
+    // CSCAdmin should not be the one queueing bio-auth
+    if (admin?.roleLevel === 5) {
+      return res.status(403).json({
+        status: "error",
+        message: "CSCAdmin cannot queue applications for bioauthentication.",
+      });
+    }
+
+    const ApplicationModel = require("../models/Application");
+
+    // Fetch applications + users
+    const applications = await Application.find({ _id: { $in: ids } }).populate("user_id", "status audit");
+
+    const results = {
+      updated: [],
+      skipped: [],
+    };
+
+    // Process sequentially (safe for audit/history). Can be optimized to bulk later.
+    for (const app of applications) {
+      const user = app.user_id;
+      if (!user || !user._id) {
+        results.skipped.push({ applicationId: app._id, reason: "missing_public_user" });
+        continue;
+      }
+
+      // Prevent queueing if already completed/approved
+      if (app.verification_level === 99 || app.status === "Approved") {
+        results.skipped.push({ applicationId: app._id, reason: "already_completed" });
+        continue;
+      }
+
+      const prevStage = app.verification_stage || ApplicationModel.getStageNameFromLevel(app.verification_level || 0);
+
+      // Reset PublicUser to pending so CSCAdmin can re-bio-auth
+      user.status.verificationStatus = "pending";
+      user.status.verifiedBy = null;
+      user.status.verifiedAt = null;
+      user.status.rejectionReason = null;
+      if (user.audit) {
+        user.audit.lastUpdated = new Date();
+        user.audit.updateCount = (user.audit.updateCount || 0) + 1;
+      }
+      await user.save();
+
+      // Reset application to CSC stage for application verification
+      app.status = "Bioauthentication";
+      app.verification_level = 5;
+      app.verification_stage = "CSC_Admin_Review";
+      app.authorization_level_index = 0;
+      app.current_verifier = {
+        verified_by: null,
+        verified_by_name: null,
+        verified_by_role: null,
+        verified_by_role_level: null,
+        remarks: null,
+        verified_at: null,
+      };
+
+      // Track this as a return-for-revision event in history
+      app.verification_history.push({
+        stage: prevStage,
+        verified_by: admin._id,
+        verified_by_name: admin.fullName,
+        verified_by_role: admin.role,
+        verified_by_role_level: admin.roleLevel,
+        action: "Returned",
+        remarks: "Sent for CSC re-bioauthentication",
+        verified_at: new Date(),
+      });
+
+      await app.save();
+      results.updated.push(app._id);
+    }
+
+    return res.status(200).json({
+      status: "success",
+      message: "Bioauthentication queue updated",
+      data: results,
+      count: results.updated.length,
+    });
+  } catch (error) {
+    console.error("Error queueing bioauthentication:", error);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to queue bioauthentication",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+});
+
 // GET /api/applications - Get applications (with filters)
 // All admins can VIEW applications, but department filtering applies:
 // - Secretary (level 3) and above (Admin level 2, Super Admin level 1) can view ALL departments
 // - Below Secretary (level > 3) can only view their own department
 router.get("/", adminAuth, async (req, res) => {
   try {
-    const { user_id, scheme_id, status, verification_stage, assigned_to_me } = req.query;
+    const {
+      user_id,
+      scheme_id,
+      status,
+      verification_stage,
+      verification_level,
+      assigned_to_me,
+      search,
+    } = req.query;
     const adminRoleLevel = req.admin.roleLevel;
     const adminDepartmentId = req.admin.departmentId;
 
     const query = {};
+
+    // Normalize status filter coming from frontend (case-insensitive)
+    const normalizeStatus = (v) => {
+      if (v === undefined || v === null) return null;
+      const s = String(v).trim().toLowerCase();
+      if (s === "applied") return "Applied";
+      if (s === "under review" || s === "under_review") return "Under Review";
+      if (s === "approved") return "Approved";
+      if (s === "rejected") return "Rejected";
+      if (s === "pending") return "Pending";
+      if (s === "bioauthentication" || s === "bio-authentication" || s === "bio_authentication")
+        return "Bioauthentication";
+      return String(v).trim();
+    };
 
     if (user_id) {
       query.user_id = user_id;
@@ -265,9 +423,7 @@ router.get("/", adminAuth, async (req, res) => {
       query.scheme_id = scheme_id;
     }
 
-    if (status) {
-      query.status = status;
-    }
+    if (status) query.status = normalizeStatus(status);
 
     if (verification_stage) {
       query.verification_stage = verification_stage;
@@ -278,10 +434,63 @@ router.get("/", adminAuth, async (req, res) => {
       query["current_verifier.verified_by"] = req.admin._id;
     }
 
-    // NOTE: Removed verification level filtering - all admins can VIEW applications
+    // verification_level filter: e.g. verification_level=5 or verification_level=5,9
+    if (verification_level) {
+      const levels = String(verification_level)
+        .split(",")
+        .map((s) => parseInt(s.trim(), 10))
+        .filter((n) => !Number.isNaN(n));
+      if (levels.length > 0) query.verification_level = levels.length === 1 ? levels[0] : { $in: levels };
+    }
+
+    // Optional search text across:
+    // - PublicUser.demographics.fullName
+    // - PublicUser.aadhaarNumber
+    // - PublicUser.contact.mobile.value
+    // - Scheme.scheme_name
+    if (search && String(search).trim().length > 0) {
+      const term = String(search).trim();
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const regex = new RegExp(escaped, "i");
+
+      const [userMatches, schemeMatches] = await Promise.all([
+        PublicUser.find({
+          $or: [
+            { "demographics.fullName": regex },
+            { aadhaarNumber: regex },
+            { "contact.mobile.value": regex },
+          ],
+        }).select("_id"),
+        Scheme.find({ scheme_name: regex }).select("_id"),
+      ]);
+
+      const userIds = userMatches.map((u) => u._id);
+      const schemeIds = schemeMatches.map((s) => s._id);
+
+      const orConditions = [];
+      if (userIds.length > 0) orConditions.push({ user_id: { $in: userIds } });
+      if (schemeIds.length > 0) orConditions.push({ scheme_id: { $in: schemeIds } });
+
+      // If no matches for search term, return empty result set.
+      query.$or = orConditions.length > 0 ? orConditions : [];
+    }
+
+    // CSC Admin (level 5): by default only show CSC-stage apps they can verify.
+    // Pass show_all=true to see all department applications.
+    if (
+      adminRoleLevel === 5 &&
+      !verification_stage &&
+      !verification_level &&
+      req.query.show_all !== "true"
+    ) {
+      query.verification_level = { $in: [5, 9] };
+      query.status = { $ne: "Rejected" };
+    }
+
+    // NOTE: Removed verification level filtering for other admins - all admins can VIEW applications
     // Verification/acceptance restrictions are still enforced in the verify endpoint
 
-    // Fetch all applications (no verification level filter for viewing)
+    // Fetch applications
     const applications = await Application.find(query)
       .populate("user_id", "demographics.fullName demographics.gender demographics.dob aadhaarNumber contact")
       .populate({
@@ -292,8 +501,8 @@ router.get("/", adminAuth, async (req, res) => {
       .sort({ createdAt: -1 });
     
     // Apply department filtering after population
-    // Secretary (level 3) and above can see all departments
-    // Below Secretary (level > 3) can only see their own department
+    // DistrictHQ Head (level 3) and above can see all departments
+    // Below DistrictHQ Head (level > 3) can only see their own department
     let filteredApplications = applications;
     if (adminRoleLevel > 3 && adminDepartmentId) {
       // Filter by department for roles below Secretary
@@ -442,19 +651,23 @@ router.get("/:id", adminAuth, async (req, res) => {
 
     // Get stage requirements using level number
     const ApplicationModel = require("../models/Application");
-    const currentLevel = application.verification_level || 0;
+    const currentLevel = ApplicationModel.normalizeVerificationLevel(application.verification_level || 0);
     const requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
 
-    // Get next level
+    // Get next level: 5(CSC)→4(District Overlookers)→3(DistrictHQ Head)→1/2(Admin)→99
     let nextLevel = null;
-    if (currentLevel === 9) nextLevel = 7;
-    else if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
-    else if (currentLevel === 1 || currentLevel === 2) nextLevel = 6;
-    else if (currentLevel === 6) nextLevel = 4;
-    else if (currentLevel === 4 || currentLevel === 5) nextLevel = 3;
-    else if (currentLevel === 3) nextLevel = 99;
+    if (currentLevel === 5) nextLevel = 4;
+    else if (currentLevel === 4) nextLevel = 3;
+    else if (currentLevel === 3) nextLevel = 1;
+    else if (currentLevel === 1 || currentLevel === 2) nextLevel = 99;
     
     const nextRequiredRoleLevels = nextLevel ? ApplicationModel.getRequiredRoleLevels(nextLevel) : [];
+
+    const adminRoleLevel = req.admin?.roleLevel ?? 999;
+    const canVerify = requiredRoleLevels.includes(adminRoleLevel);
+
+    const currentStage = ApplicationModel.getStageNameFromLevel(currentLevel);
+    const nextStage = nextLevel ? ApplicationModel.getStageNameFromLevel(nextLevel) : null;
 
     const appObj = application.toObject();
     const transformedApp = {
@@ -463,15 +676,25 @@ router.get("/:id", adminAuth, async (req, res) => {
       applicantId: application.user_id?._id || null,
       schemeName: application.scheme_id?.scheme_name || "Unknown",
       schemeId: application.scheme_id?._id || null,
-      // Alias for admin UI convenience
       documents_submitted: appObj.documents_submitted || [],
       documents: appObj.documents_submitted || [],
+      // Application's current stage (not admin level)
       verification_level: currentLevel,
-      verification_stage: ApplicationModel.getStageNameFromLevel(currentLevel),
+      verification_stage: currentStage,
+      currentVerificationLevel: currentLevel,
+      currentStage,
       required_role_levels: requiredRoleLevels,
+      requiredRoleLevels,
+      // Application's next stage
       next_verification_level: nextLevel,
-      next_verification_stage: nextLevel ? ApplicationModel.getStageNameFromLevel(nextLevel) : null,
+      next_verification_stage: nextStage,
+      nextVerificationLevel: nextLevel,
+      nextStage,
       next_required_role_levels: nextRequiredRoleLevels,
+      nextRequiredRoleLevels: nextRequiredRoleLevels,
+      // Logged-in admin's role level and permission
+      canVerify,
+      currentAdminLevel: adminRoleLevel,
     };
 
     res.status(200).json({
@@ -494,16 +717,14 @@ router.get("/:id", adminAuth, async (req, res) => {
   }
 });
 
-// Helper function to get stage requirements
+// Helper function to get stage requirements (sequential levels 1-5)
 function getStageRequirements(stage) {
   const requirements = {
-    Applied: { roleLevels: [9], roleNames: ["CSD Admin"] },
-    CSD_Admin_Review: { roleLevels: [9], roleNames: ["CSD Admin"] },
-    Post_Operator_Review: { roleLevels: [7, 8], roleNames: ["District Overlookers", "Post Operator"] },
+    Applied: { roleLevels: [5], roleNames: ["CSC Admin"] },
+    CSC_Admin_Review: { roleLevels: [5], roleNames: ["CSC Admin"] },
+    District_Overlookers_Review: { roleLevels: [4], roleNames: ["District Overlookers"] },
     Admin_Review: { roleLevels: [1, 2], roleNames: ["Super Admin", "Admin"] },
-    District_Head_Review: { roleLevels: [6], roleNames: ["DistrictHQ Head"] },
-    Department_Review: { roleLevels: [4, 5], roleNames: ["Department Head", "Department User"] },
-    Secretary_Review: { roleLevels: [3], roleNames: ["Department Secretary"] },
+    District_Head_Review: { roleLevels: [3], roleNames: ["DistrictHQ Head"] },
     Completed: { roleLevels: [], roleNames: [] },
   };
   return requirements[stage] || { roleLevels: [], roleNames: [] };
@@ -512,18 +733,14 @@ function getStageRequirements(stage) {
 // Helper function to get next stage requirements
 function getNextStageRequirements(stage) {
   const nextStages = {
-    Applied: "CSD_Admin_Review",
-    CSD_Admin_Review: "Post_Operator_Review",
-    Post_Operator_Review: "Admin_Review",
-    Admin_Review: "District_Head_Review",
-    District_Head_Review: "Department_Review",
-    Department_Review: "Secretary_Review",
-    Secretary_Review: "Completed",
+    Applied: "CSC_Admin_Review",
+    CSC_Admin_Review: "District_Overlookers_Review",
+    District_Overlookers_Review: "District_Head_Review",
+    District_Head_Review: "Admin_Review",
+    Admin_Review: "Completed",
     Completed: null,
   };
-  const nextStage = nextStages[stage];
-  if (!nextStage) return null;
-  return getStageRequirements(nextStage);
+  return nextStages[stage] ? getStageRequirements(nextStages[stage]) : null;
 }
 
 // GET /api/applications/:id/next-stage-admins - Get available admins for next verification stage
@@ -540,31 +757,40 @@ router.get("/:id/next-stage-admins", adminAuth, async (req, res) => {
     }
 
     const ApplicationModel = require("../models/Application");
-    const currentLevel = application.verification_level || 0;
+    const currentLevel = ApplicationModel.normalizeVerificationLevel(application.verification_level || 0);
 
-    // Get next level
+    // Get next level: 5(CSC)→4(District Overlookers)→3(DistrictHQ Head)→1/2(Admin)→99
     let nextLevel = null;
-    if (currentLevel === 9) nextLevel = 7;
-    else if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
-    else if (currentLevel === 1 || currentLevel === 2) nextLevel = 6;
-    else if (currentLevel === 6) nextLevel = 4;
-    else if (currentLevel === 4 || currentLevel === 5) nextLevel = 3;
-    else if (currentLevel === 3) nextLevel = 99;
+    if (currentLevel === 5) nextLevel = 4;
+    else if (currentLevel === 4) nextLevel = 3;
+    else if (currentLevel === 3) nextLevel = 1;
+    else if (currentLevel === 1 || currentLevel === 2) nextLevel = 99;
 
     if (!nextLevel || nextLevel === 99) {
+      const currentRequiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
+      const currentAdminCanVerify = currentRequiredRoleLevels.includes(req.admin.roleLevel);
       return res.status(200).json({
         status: "success",
         message: "No next stage available (application is at final stage)",
         data: [],
         next_verification_level: null,
         next_verification_stage: null,
+        nextVerificationLevel: null,
+        nextStage: null,
+        currentAdminLevel: req.admin.roleLevel,
+        currentVerificationLevel: currentLevel,
+        currentStage: ApplicationModel.getStageNameFromLevel(currentLevel),
+        higherAuthorityLevels: [],
+        currentAdminCanVerify,
       });
     }
     
     const nextRequiredRoleLevels = ApplicationModel.getRequiredRoleLevels(nextLevel);
+    const currentRequiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
 
     // Get current admin level
     const currentAdminLevel = req.admin.roleLevel;
+    const currentAdminCanVerify = currentRequiredRoleLevels.includes(currentAdminLevel);
 
     // Get all role levels that are higher authority (lower number) than current admin
     const higherAuthorityLevels = [];
@@ -598,16 +824,29 @@ router.get("/:id/next-stage-admins", adminAuth, async (req, res) => {
     // Sort by role level (ascending - higher authority first)
     adminsWithLevel.sort((a, b) => a.roleLevel - b.roleLevel);
 
+    const currentStage = ApplicationModel.getStageNameFromLevel(currentLevel);
+    const nextStage = ApplicationModel.getStageNameFromLevel(nextLevel);
+
     res.status(200).json({
       status: "success",
       data: adminsWithLevel,
+      // Application's current stage (number and name)
       current_verification_level: currentLevel,
-      current_verification_stage: ApplicationModel.getStageNameFromLevel(currentLevel),
+      current_verification_stage: currentStage,
+      currentVerificationLevel: currentLevel,
+      currentStage,
+      // Application's next stage
       next_verification_level: nextLevel,
-      next_verification_stage: ApplicationModel.getStageNameFromLevel(nextLevel),
+      next_verification_stage: nextStage,
+      nextVerificationLevel: nextLevel,
+      nextStage,
       required_role_levels: nextRequiredRoleLevels,
-      currentAdminLevel: currentAdminLevel,
+      requiredRoleLevels: nextRequiredRoleLevels,
+      // Logged-in admin's role level (not application stage)
+      currentAdminLevel,
+      // Role levels that are higher authority than current admin (for "forward to" list)
       higherAuthorityLevels: higherAuthorityLevels,
+      currentAdminCanVerify,
     });
   } catch (error) {
     console.error("Error fetching next stage admins:", error);
@@ -628,17 +867,74 @@ router.get("/:id/next-stage-admins", adminAuth, async (req, res) => {
 // Helper function to get next stage name
 function getNextStageName(stage) {
   const nextStages = {
-    Applied: "CSD_Admin_Review",
-    CSD_Admin_Review: "Post_Operator_Review",
-    Post_Operator_Review: "Admin_Review",
-    Admin_Review: "District_Head_Review",
-    District_Head_Review: "Department_Review",
-    Department_Review: "Secretary_Review",
-    Secretary_Review: "Completed",
+    Applied: "CSC_Admin_Review",
+    CSC_Admin_Review: "District_Overlookers_Review",
+    District_Overlookers_Review: "District_Head_Review",
+    District_Head_Review: "Admin_Review",
+    Admin_Review: "Completed",
     Completed: null,
   };
   return nextStages[stage] || null;
 }
+
+// POST /api/applications/:id/send-completion-otp - Send OTP to admin's mobile to verify authority before completing
+router.post("/:id/send-completion-otp", adminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const admin = req.admin;
+
+    const application = await Application.findById(id);
+    if (!application) {
+      return res.status(404).json({ status: "error", message: "Application not found" });
+    }
+
+    const adminUser = await AdminUser.findById(admin._id).select("contactNumber");
+    const mobileNumber = adminUser?.contactNumber?.trim();
+    if (!mobileNumber) {
+      return res.status(400).json({
+        status: "error",
+        message: "Your admin account has no phone number. Add contactNumber to complete applications.",
+      });
+    }
+
+    const ApplicationModel = require("../models/Application");
+    const currentLevel = ApplicationModel.normalizeVerificationLevel(application.verification_level || 0);
+    const isAdminReview = currentLevel === 1 || currentLevel === 2;
+    const requiredRoleLevels = ApplicationModel.getRequiredRoleLevels(currentLevel);
+    const canVerify = requiredRoleLevels.includes(admin.roleLevel);
+
+    if (!isAdminReview || !canVerify) {
+      return res.status(403).json({
+        status: "error",
+        message: "Only Super Admin or Admin can send completion OTP when application is at Admin_Review stage.",
+        verification_level: currentLevel,
+      });
+    }
+
+    const purpose = `application_complete_${id}_${admin._id}`;
+    const result = await requestOTP(mobileNumber, purpose);
+
+    if (!result.success) {
+      return res.status(400).json({
+        status: "error",
+        message: result.message || "Failed to send OTP",
+      });
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: "OTP sent to your registered mobile number. Enter it to complete the application.",
+      ...(process.env.NODE_ENV !== "production" && result.otp ? { otp: result.otp } : {}),
+    });
+  } catch (error) {
+    console.error("Send completion OTP error:", error);
+    res.status(500).json({
+      status: "error",
+      message: "Failed to send OTP",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+});
 
 // POST /api/applications/:id/verify - Verify application (multi-level workflow)
 router.post("/:id/verify", adminAuth, async (req, res) => {
@@ -680,27 +976,39 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     // Get current level - handle backward compatibility
     let currentLevel = application.verification_level;
     
-    // If verification_level is not set, derive from verification_stage (backward compatibility)
+    // If verification_level is not set, derive from verification_stage
     if (currentLevel === null || currentLevel === undefined) {
       const stageMap = {
-        "Applied": 0,
-        "CSD_Admin_Review": 9,
-        "Post_Operator_Review": 7,
-        "Admin_Review": 1,
-        "District_Head_Review": 6,
-        "Department_Review": 4,
-        "Secretary_Review": 3,
-        "Completed": 99
+        Applied: 0,
+        CSC_Admin_Review: 5,
+        District_Overlookers_Review: 4,
+        Admin_Review: 1,
+        District_Head_Review: 3,
+        Completed: 99,
       };
-      currentLevel = stageMap[application.verification_stage] || 9; // Default to 9 (CSD Admin) if unknown
-      // Update the application with the level
+      currentLevel = stageMap[application.verification_stage] ?? 5;
       application.verification_level = currentLevel;
     }
+    // Normalize levels to sequential (1-5) for logic
+    currentLevel = ApplicationModel.normalizeVerificationLevel(currentLevel);
     
     const adminRoleLevel = admin.roleLevel;
 
-    // Get authorization levels from application (scheme-specific workflow)
-    const authorizationLevels = application.authorization_levels || [];
+    // Use scheme's authorization_levels as source of truth (follows [1,3] etc); fallback to application if scheme has none
+    const schemeId = application.scheme_id?._id ?? application.scheme_id;
+    const schemeDoc =
+      application.scheme_id?.authorization_levels !== undefined
+        ? application.scheme_id
+        : await Scheme.findById(schemeId).select("authorization_levels");
+    const schemeAuthLevels = (schemeDoc?.authorization_levels || [])
+      .map(mapOldAuthorizationLevelToNew)
+      .filter((v) => v === 1 || v === 2 || v === 3 || v === 4);
+    const authorizationLevels =
+      schemeAuthLevels.length > 0
+        ? schemeAuthLevels
+        : (application.authorization_levels || [])
+            .map(mapOldAuthorizationLevelToNew)
+            .filter((v) => v === 1 || v === 2 || v === 3 || v === 4);
     const authorizationLevelIndex = application.authorization_level_index || 0;
     
     // Check if using scheme-specific workflow or default workflow
@@ -719,38 +1027,36 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     
     if (canVerify) {
       if (action === "Verified" || action === "Forwarded") {
-        // CSD Admin (9) always forwards to Post Operator (7) first
-        if (currentLevel === 9) {
-          nextLevel = 7;
+        // CSC Admin (5) always forwards to District Overlookers (4) first
+        if (currentLevel === 5) {
+          nextLevel = 4;
           nextAuthorizationLevelIndex = 0;
         } else if (useSchemeWorkflow) {
-          // Flow in REVERSE order: 7 → auth[last] → auth[last-1] → ... → auth[0] → 99
-          // [3, 4, 8] means 8 first, then 4, then 3 (reverse of array order)
-          // Skip 7→8: both are Post Operator, so go 7→4 (Department) directly
           if (authorizationLevelIndex < authorizationLevels.length) {
             let reverseIndex = authorizationLevels.length - 1 - authorizationLevelIndex;
             nextLevel = authorizationLevels[reverseIndex];
             nextAuthorizationLevelIndex = authorizationLevelIndex + 1;
-            // If at 7 and next is 8 (same stage), skip to next distinct level
-            if (currentLevel === 7 && nextLevel === 8 && nextAuthorizationLevelIndex < authorizationLevels.length) {
-              reverseIndex = authorizationLevels.length - 1 - nextAuthorizationLevelIndex;
-              nextLevel = authorizationLevels[reverseIndex];
-              nextAuthorizationLevelIndex++;
-            }
           }
-          if (nextLevel === null || nextAuthorizationLevelIndex > authorizationLevels.length) {
+          // Complete when: no next level, or we've finished scheme sequence, or next would repeat current (duplicate levels in scheme)
+          if (
+            nextLevel === null ||
+            nextAuthorizationLevelIndex >= authorizationLevels.length ||
+            nextLevel === currentLevel
+          ) {
             nextLevel = 99;
           }
         } else {
-          // Use default workflow: 9 -> 7 -> 6 -> 3 -> Completed
-          if (currentLevel === 9) {
-            nextLevel = 7; // CSD Admin -> Post Operator
-          } else if (currentLevel === 7 || currentLevel === 8) {
-            nextLevel = 6; // Post Operator -> District Head
-          } else if (currentLevel === 6) {
-            nextLevel = 3; // District Head -> Secretary
+          // Default workflow: 5(CSC) → 4(District Overlookers) → 3(DistrictHQ Head) → 1/2(Admin) → 99
+          if (currentLevel === 5) {
+            nextLevel = 4;
+          } else if (currentLevel === 4) {
+            nextLevel = 3;
           } else if (currentLevel === 3) {
-            nextLevel = 99; // Secretary -> Completed
+            nextLevel = 1;
+          } else if (currentLevel === 1 || currentLevel === 2) {
+            nextLevel = 99;
+          } else if (currentLevel === 99) {
+            nextLevel = 99;
           }
         }
       } else if (action === "Returned") {
@@ -762,20 +1068,20 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
             nextLevel = authorizationLevels[reverseIndex];
           } else if (authorizationLevelIndex === 1) {
             nextAuthorizationLevelIndex = 0;
-            nextLevel = 7; // Back to Post Operator
+            nextLevel = 4; // Back to District Overlookers
           } else {
             nextLevel = currentLevel; // Already at 7, can't go back
           }
         } else {
-          // Use default workflow for returns: 3 -> 6 -> 7/8 -> 9 -> (can't go back)
-          if (currentLevel === 3) {
-            nextLevel = 6; // Secretary -> District Head
-          } else if (currentLevel === 6) {
-            nextLevel = 7; // District Head -> Post Operator
-          } else if (currentLevel === 7 || currentLevel === 8) {
-            nextLevel = 9; // Post Operator -> CSD Admin
-          } else if (currentLevel === 9) {
-            nextLevel = currentLevel; // Stay at CSD Admin (can't go back further)
+          // Return (one step back): 1/2→3, 3→4, 4→5, 5→stay
+          if (currentLevel === 1 || currentLevel === 2) {
+            nextLevel = 3;
+          } else if (currentLevel === 3) {
+            nextLevel = 4;
+          } else if (currentLevel === 4) {
+            nextLevel = 5;
+          } else if (currentLevel === 5) {
+            nextLevel = currentLevel;
           }
         }
       }
@@ -783,9 +1089,19 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
 
     if (!canVerify) {
       const stageName = ApplicationModel.getStageNameFromLevel(currentLevel);
+      const isCscStage = currentLevel === 5;
+      const isCscAdmin = adminRoleLevel === 5;
+      let message = `You don't have permission to verify applications at verification level ${currentLevel}. Required role levels: ${requiredRoleLevels.join(", ")}`;
+      let reason = "role_mismatch";
+      if (isCscAdmin && !isCscStage) {
+        message =
+          "This application is not at CSC Admin (bio-auth) stage. Only applications pending CSC verification can be verified by CSC Admin.";
+        reason = "application_not_at_csc_stage";
+      }
       return res.status(403).json({
         status: "error",
-        message: `You don't have permission to verify applications at verification level ${currentLevel}. Required role levels: ${requiredRoleLevels.join(", ")}`,
+        reason,
+        message,
         verification_level: currentLevel,
         verification_stage: stageName,
         required_role_levels: requiredRoleLevels,
@@ -793,11 +1109,48 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
       });
     }
 
-    // Handle rejection: reset to first stage (Post Operator) so applicant can revise and re-submit
+    // At Admin_Review (level 1/2), OTP verification required - admin must verify their identity via OTP to their phone
+    const isAdminReview = currentLevel === 1 || currentLevel === 2;
+    if (
+      (action === "Verified" || action === "Forwarded") &&
+      nextLevel === 99 &&
+      isAdminReview
+    ) {
+      const { otp } = req.body;
+      const mobileNumber = adminUser?.contactNumber?.trim();
+
+      if (!mobileNumber) {
+        return res.status(400).json({
+          status: "error",
+          reason: "no_phone",
+          message: "Your admin account has no phone number. Add contactNumber to complete applications.",
+        });
+      }
+      if (!otp || typeof otp !== "string" || !otp.trim()) {
+        return res.status(400).json({
+          status: "error",
+          reason: "otp_required",
+          message:
+            "OTP verification required. Send OTP first via POST /api/applications/:id/send-completion-otp, then provide otp in the request body.",
+        });
+      }
+
+      const purpose = `application_complete_${id}_${admin._id}`;
+      const verification = verifyOTP(mobileNumber, otp.trim(), purpose);
+      if (!verification.valid) {
+        return res.status(400).json({
+          status: "error",
+          reason: "otp_invalid",
+          message: verification.message,
+        });
+      }
+    }
+
+    // Handle rejection: reset to first stage (District Overlookers) so applicant can revise and re-submit
     if (action === "Rejected") {
       application.status = "Rejected";
-      application.verification_level = 7; // Post Operator - first stage after CSD Admin
-      application.verification_stage = "Post_Operator_Review";
+      application.verification_level = 4; // District Overlookers - first stage after CSC Admin
+      application.verification_stage = "District_Overlookers_Review";
       application.authorization_level_index = 0;
       application.current_verifier = {
         verified_by: null,
@@ -810,6 +1163,10 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     } else if (nextLevel === 99) {
       // Verification completed successfully - set status to Approved
       application.status = "Approved";
+      if (isAdminReview) application.completion_otp_verified_at = new Date();
+    } else {
+      // Moving to next stage - no longer "just applied"
+      application.status = "Under Review";
     }
 
     // Add to verification history
@@ -910,18 +1267,25 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     // Update verification level and authorization index
     if (nextLevel !== null) {
       application.verification_level = nextLevel;
-      application.verification_stage = ApplicationModel.getStageNameFromLevel(nextLevel); // Legacy field for backward compatibility
+      application.verification_stage = ApplicationModel.getStageNameFromLevel(nextLevel);
       if (useSchemeWorkflow) {
         application.authorization_level_index = nextAuthorizationLevelIndex;
+        // Fix corrupt authorization_levels: sync to scheme's [1,3] etc
+        if (
+          schemeAuthLevels.length > 0 &&
+          JSON.stringify(application.authorization_levels) !== JSON.stringify(authorizationLevels)
+        ) {
+          application.authorization_levels = authorizationLevels;
+        }
       }
     }
     
     // Ensure verification_level is always set
     if (!application.verification_level && application.verification_level !== 0) {
-      application.verification_level = 7; // Default to Post Operator level
+      application.verification_level = 4; // Default to District Overlookers level
     }
 
-    // Update legacy fields for backward compatibility
+    // Update reviewed_by, reviewed_at, remarks
     application.reviewed_by = admin._id;
     application.reviewed_at = new Date();
     if (remarks) {
@@ -949,8 +1313,8 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
       // Alias for admin UI convenience
       documents_submitted: appObj.documents_submitted || [],
       documents: appObj.documents_submitted || [],
-      verification_level: updatedApplication.verification_level || 7,
-      verification_stage: ApplicationModel.getStageNameFromLevel(updatedApplication.verification_level || 7),
+      verification_level: updatedApplication.verification_level || 4,
+      verification_stage: ApplicationModel.getStageNameFromLevel(updatedApplication.verification_level || 4),
     };
 
     res.status(200).json({
@@ -1065,6 +1429,7 @@ router.get("/user/:user_id/summary", async (req, res) => {
       total: applications.length,
       applied: 0,
       under_review: 0,
+      bioauthentication: 0,
       approved: 0,
       rejected: 0,
       pending: 0,
@@ -1073,34 +1438,31 @@ router.get("/user/:user_id/summary", async (req, res) => {
     // Count by verification stage
     const stageCounts = {
       applied: 0,
-      csd_admin_review: 0,
-      post_operator_review: 0,
+      csc_admin_review: 0,
+      district_overlookers_review: 0,
       admin_review: 0,
-      district_review: 0,
-      department_review: 0,
-      secretary_review: 0,
+      district_head_review: 0,
       completed: 0,
     };
 
     const summary = applications.map(app => {
       const status = app.status;
-      const level = app.verification_level || 0;
+      const level = ApplicationModel.normalizeVerificationLevel(app.verification_level || 0);
       
       // Update status counts
       if (status === "Applied") statusCounts.applied++;
       else if (status === "Under Review") statusCounts.under_review++;
+      else if (status === "Bioauthentication") statusCounts.bioauthentication++;
       else if (status === "Approved") statusCounts.approved++;
       else if (status === "Rejected") statusCounts.rejected++;
       else if (status === "Pending") statusCounts.pending++;
 
-      // Update stage counts
+      // Update stage counts (sequential levels 1-5)
       if (level === 0) stageCounts.applied++;
-      else if (level === 9) stageCounts.csd_admin_review++;
-      else if (level === 7 || level === 8) stageCounts.post_operator_review++;
+      else if (level === 5) stageCounts.csc_admin_review++;
+      else if (level === 4) stageCounts.district_overlookers_review++;
       else if (level === 1 || level === 2) stageCounts.admin_review++;
-      else if (level === 6) stageCounts.district_review++;
-      else if (level === 4 || level === 5) stageCounts.department_review++;
-      else if (level === 3) stageCounts.secretary_review++;
+      else if (level === 3) stageCounts.district_head_review++;
       else if (level === 99) stageCounts.completed++;
 
       return {
@@ -1162,7 +1524,7 @@ router.get("/user/:user_id", async (req, res) => {
     const ApplicationModel = require("../models/Application");
     const transformedApplications = applications.map(app => {
       const appObj = app.toObject();
-      const currentLevel = app.verification_level || 0;
+      const currentLevel = ApplicationModel.normalizeVerificationLevel(app.verification_level || 0);
       
       return {
         _id: app._id,
@@ -1233,15 +1595,13 @@ router.get("/user/:user_id/:application_id", async (req, res) => {
 
     // Transform to include all details
     const ApplicationModel = require("../models/Application");
-    const currentLevel = application.verification_level || 0;
+    const currentLevel = ApplicationModel.normalizeVerificationLevel(application.verification_level || 0);
 
-    // Get next level info
+    // Get next level: 5→4→3→1/2→99
     let nextLevel = null;
-    if (currentLevel === 9) nextLevel = 7;
-    else if (currentLevel === 7 || currentLevel === 8) nextLevel = 1;
-    else if (currentLevel === 1 || currentLevel === 2) nextLevel = 6;
-    else if (currentLevel === 6) nextLevel = 4;
-    else if (currentLevel === 4 || currentLevel === 5) nextLevel = 3;
+    if (currentLevel === 5) nextLevel = 4;
+    else if (currentLevel === 4) nextLevel = 1;
+    else if (currentLevel === 1 || currentLevel === 2) nextLevel = 3;
     else if (currentLevel === 3) nextLevel = 99;
 
     const appObj = application.toObject();
@@ -1322,25 +1682,24 @@ function getStatusDisplay(status) {
     "Approved": "Approved",
     "Rejected": "Rejected",
     "Pending": "Pending Additional Information",
+    "Bioauthentication": "Bioauthentication Required",
   };
   return statusMap[status] || status;
 }
 
 function getVerificationStageDisplay(level) {
+  const AppModel = require("../models/Application");
+  const normalized = AppModel.normalizeVerificationLevel(level);
   const stageMap = {
     0: "Application Submitted",
-    9: "CSD Admin Review",
-    7: "Post Operator Review",
-    8: "Post Operator Review",
+    5: "CSC Admin Review",
+    4: "District Overlookers Review",
     1: "Admin Review",
     2: "Admin Review",
-    6: "District Head Review",
-    4: "Department Review",
-    5: "Department Review",
-    3: "Secretary Review",
+    3: "District Head Review",
     99: "Completed",
   };
-  return stageMap[level] || "Unknown Stage";
+  return stageMap[normalized] || "Unknown Stage";
 }
 
 function getActionDisplay(action) {
@@ -1354,11 +1713,11 @@ function getActionDisplay(action) {
 }
 
 // PUT /api/applications/:applicationId/approve - Approve an application
-// Query params: username, password (for admin auth)
+// When at Admin_Review, OTP verification is required. Send OTP via POST /:id/send-completion-otp first.
 router.put("/:applicationId/approve", adminAuth, async (req, res) => {
   try {
     const { applicationId } = req.params;
-    const { remarks } = req.body;
+    const { remarks, otp } = req.body;
     const admin = req.admin;
 
     const application = await Application.findById(applicationId)
@@ -1396,13 +1755,59 @@ router.put("/:applicationId/approve", adminAuth, async (req, res) => {
       });
     }
 
+    const ApplicationModel = require("../models/Application");
+    const currentLevel = ApplicationModel.normalizeVerificationLevel(application.verification_level || 0);
+    const isAdminReview = currentLevel === 1 || currentLevel === 2;
+    // Only Super Admin or Admin can use the approve endpoint
+    const canApprove = admin.roleLevel <= 2;
+
+    if (!canApprove) {
+      return res.status(403).json({
+        status: "error",
+        message: "Only Super Admin or Admin can approve applications.",
+      });
+    }
+
+    // At Admin_Review stage, OTP verification required - admin must verify their identity via OTP to their phone
+    if (isAdminReview) {
+      const adminUserDoc = await AdminUser.findById(admin._id).select("contactNumber");
+      const mobileNumber = adminUserDoc?.contactNumber?.trim();
+      if (!mobileNumber) {
+        return res.status(400).json({
+          status: "error",
+          reason: "no_phone",
+          message: "Your admin account has no phone number. Add contactNumber to complete applications.",
+        });
+      }
+      if (!otp || typeof otp !== "string" || !otp.trim()) {
+        return res.status(400).json({
+          status: "error",
+          reason: "otp_required",
+          message:
+            "OTP verification required. Send OTP first via POST /api/applications/:id/send-completion-otp, then provide otp in the request body.",
+        });
+      }
+      const purpose = `application_complete_${applicationId}_${admin._id}`;
+      const verification = verifyOTP(mobileNumber, otp.trim(), purpose);
+      if (!verification.valid) {
+        return res.status(400).json({
+          status: "error",
+          reason: "otp_invalid",
+          message: verification.message,
+        });
+      }
+    }
+
     // Update application status
     application.status = "Approved";
+    application.verification_level = 99;
     application.verification_stage = "Completed";
+    if (isAdminReview) application.completion_otp_verified_at = new Date();
 
     // Add to verification history
     application.verification_history.push({
-      stage: application.verification_stage,
+      stage: ApplicationModel.getStageNameFromLevel(currentLevel),
+      verification_level: currentLevel,
       verified_by: admin._id,
       verified_by_name: admin.fullName,
       verified_by_role: admin.role,
@@ -1422,7 +1827,7 @@ router.put("/:applicationId/approve", adminAuth, async (req, res) => {
       verified_at: new Date(),
     };
 
-    // Update legacy fields
+    // Update reviewed_by, reviewed_at
     application.reviewed_by = admin._id;
     application.reviewed_at = new Date();
     if (remarks) {
@@ -1539,8 +1944,11 @@ router.post("/:applicationId/forward", adminAuth, async (req, res) => {
     }
 
     // Check if target admin has appropriate role level for current or next stage
-    const currentStageReqs = getStageRequirements(application.verification_stage);
-    const nextStageReqs = getNextStageRequirements(application.verification_stage);
+    const ApplicationModel = require("../models/Application");
+    const currentLevel = ApplicationModel.normalizeVerificationLevel(application.verification_level || 0);
+    const currentStage = ApplicationModel.getStageNameFromLevel(currentLevel);
+    const currentStageReqs = getStageRequirements(currentStage);
+    const nextStageReqs = getNextStageRequirements(currentStage);
 
     const canHandleCurrentStage = currentStageReqs.roleLevels.includes(targetAdminLevel);
     const canHandleNextStage = nextStageReqs && nextStageReqs.roleLevels.includes(targetAdminLevel);
@@ -1549,7 +1957,7 @@ router.post("/:applicationId/forward", adminAuth, async (req, res) => {
       return res.status(400).json({
         status: "error",
         message: `Target admin does not have appropriate role level for current or next verification stage.`,
-        currentStage: application.verification_stage,
+        currentStage,
         currentStageRequiredLevels: currentStageReqs.roleLevels,
         nextStageRequiredLevels: nextStageReqs ? nextStageReqs.roleLevels : null,
         targetAdminLevel: targetAdminLevel,
@@ -1558,7 +1966,7 @@ router.post("/:applicationId/forward", adminAuth, async (req, res) => {
 
     // Add to verification history
     application.verification_history.push({
-      stage: application.verification_stage,
+      stage: currentStage,
       verified_by: admin._id,
       verified_by_name: admin.fullName,
       verified_by_role: admin.role,
@@ -1581,7 +1989,7 @@ router.post("/:applicationId/forward", adminAuth, async (req, res) => {
     // Update status
     application.status = "Under Review";
 
-    // Update legacy fields
+    // Update reviewed_by, reviewed_at
     application.reviewed_by = admin._id;
     application.reviewed_at = new Date();
     if (remarks) {
@@ -1689,7 +2097,7 @@ router.put("/:applicationId/reject", adminAuth, async (req, res) => {
       verified_at: new Date(),
     };
 
-    // Update legacy fields
+    // Update reviewed_by, reviewed_at
     application.reviewed_by = admin._id;
     application.reviewed_at = new Date();
     if (remarks) {

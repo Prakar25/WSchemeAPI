@@ -26,7 +26,7 @@ const applicationSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["Applied", "Under Review", "Approved", "Rejected", "Pending"],
+      enum: ["Applied", "Under Review", "Approved", "Rejected", "Pending", "Bioauthentication"],
       default: "Applied",
     },
     date_applied: {
@@ -57,12 +57,13 @@ const applicationSchema = new mongoose.Schema(
       },
     ],
     // Verification workflow level (store as number, not string)
+    // Sequential: 0=Applied, 5=CSC Admin (first), 4=District Overlookers, 1/2=Admin, 3=DistrictHQ Head, 99=Completed
+    // 6,7,8,9 normalized to 3,4,5 via normalizeVerificationLevel
     verification_level: {
       type: Number,
-      enum: [0, 9, 7, 8, 1, 2, 6, 4, 5, 3, 99], // 0=Applied, 9=CSD Admin (first), 7/8=Post Operator, 1/2=Admin, 6=District, 4/5=Dept, 3=Secretary, 99=Completed
+      enum: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 99],
       default: 0, // Applied
     },
-    // Legacy field for backward compatibility (will be removed)
     verification_stage: {
       type: String,
       required: false,
@@ -134,7 +135,6 @@ const applicationSchema = new mongoose.Schema(
         default: null,
       },
     },
-    // Legacy fields (kept for backward compatibility)
     remarks: {
       type: String,
       default: null,
@@ -149,46 +149,56 @@ const applicationSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    // OTP verification for Admin_Review completion (Super Admin/Admin must verify applicant OTP before approving)
+    completion_otp_verified_at: {
+      type: Date,
+      default: null,
+    },
   },
   {
     timestamps: true,
   }
 );
 
-// Helper function to get stage name from level
-function getStageNameFromLevel(level) {
-  const stageMap = {
-    0: "Applied",
-    9: "CSD_Admin_Review",
-    7: "Post_Operator_Review",
-    8: "Post_Operator_Review",
-    1: "Admin_Review",
-    2: "Admin_Review",
-    6: "District_Head_Review",
-    4: "Department_Review",
-    5: "Department_Review",
-    3: "Secretary_Review",
-    99: "Completed"
-  };
-  return stageMap[level] || "Applied";
+// Map verification levels to sequential (1-5)
+// Only map old levels (6,7,8,9) - leave 3,4,5 as-is (already sequential)
+function normalizeVerificationLevel(level) {
+  const n = typeof level === "number" ? level : parseInt(level, 10);
+  if (!Number.isInteger(n)) return 0;
+  if (n === 9) return 5;   // CSC Admin
+  if (n === 7 || n === 8) return 4; // District Overlookers
+  if (n === 6) return 3;   // DistrictHQ Head
+  return n; // 0, 1, 2, 3, 4, 5, 99 stay as-is
 }
 
-// Helper function to get required role levels for a verification level
+// Helper function to get stage name from level (sequential levels 1-5)
+function getStageNameFromLevel(level) {
+  const normalized = normalizeVerificationLevel(level);
+  const stageMap = {
+    0: "Applied",
+    5: "CSC_Admin_Review",
+    4: "District_Overlookers_Review",
+    1: "Admin_Review",
+    2: "Admin_Review",
+    3: "District_Head_Review",
+    99: "Completed"
+  };
+  return stageMap[normalized] || "Applied";
+}
+
+// Helper function to get required role levels for a verification level (sequential 1-5)
 function getRequiredRoleLevels(level) {
+  const normalized = normalizeVerificationLevel(level);
   const levelMap = {
-    0: [9],    // Applied -> CSD Admin (9) first
-    9: [9],    // CSD Admin Review
-    7: [7, 8], // Post Operator Review
-    8: [7, 8], // Post Operator Review
+    0: [5],    // Applied -> CSC Admin (5) first
+    5: [5],    // CSC Admin Review
+    4: [4],    // District_Overlookers_Review handled by District Overlookers (4)
     1: [1, 2], // Admin Review
     2: [1, 2], // Admin Review
-    6: [6],    // District Head Review
-    4: [4, 5], // Department Review
-    5: [4, 5], // Department Review
-    3: [3],    // Secretary Review
+    3: [3],    // District_Head_Review - DistrictHQ Head (3)
     99: []     // Completed
   };
-  return levelMap[level] || [9];
+  return levelMap[normalized] || [5];
 }
 
 // Virtual to get stage name
@@ -212,11 +222,12 @@ applicationSchema.index({ user_id: 1 });
 applicationSchema.index({ scheme_id: 1 });
 applicationSchema.index({ status: 1 });
 applicationSchema.index({ verification_level: 1 });
-applicationSchema.index({ verification_stage: 1 }); // Keep for backward compatibility
+applicationSchema.index({ verification_stage: 1 });
 applicationSchema.index({ "current_verifier.verified_by": 1 });
 applicationSchema.index({ user_id: 1, scheme_id: 1 }); // Compound index for duplicate detection
 
 module.exports = mongoose.model("Application", applicationSchema);
 module.exports.getStageNameFromLevel = getStageNameFromLevel;
 module.exports.getRequiredRoleLevels = getRequiredRoleLevels;
+module.exports.normalizeVerificationLevel = normalizeVerificationLevel;
 

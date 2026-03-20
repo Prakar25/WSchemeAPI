@@ -335,8 +335,8 @@ router.post(
   requireRole([
     AdminUser.ROLES.SUPER_ADMIN,
     AdminUser.ROLES.ADMIN,
-    AdminUser.ROLES.DEPARTMENT_HEAD,
-    AdminUser.ROLES.DEPARTMENT_SECRETARY,
+    AdminUser.ROLES.DISTRICTHQ_HEAD,
+    AdminUser.ROLES.DISTRICT_OVERLOOKERS,
   ]),
   upload.single("file"),
   async (req, res) => {
@@ -562,8 +562,8 @@ router.post(
   requireRole([
     AdminUser.ROLES.SUPER_ADMIN,
     AdminUser.ROLES.ADMIN,
-    AdminUser.ROLES.DEPARTMENT_HEAD,
-    AdminUser.ROLES.DEPARTMENT_SECRETARY,
+    AdminUser.ROLES.DISTRICTHQ_HEAD,
+    AdminUser.ROLES.DISTRICT_OVERLOOKERS,
   ]),
   async (req, res) => {
     try {

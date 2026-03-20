@@ -1,42 +1,30 @@
 const mongoose = require('mongoose');
 
-// Admin roles hierarchy (Super Admin = highest, Post Operator = lowest)
+// Admin roles hierarchy (Super Admin = highest, CSCAdmin = lowest)
 const ADMIN_ROLES = {
-  POST_OPERATOR: 'Post Operator',
-  DISTRICT_OVERLOOKERS: 'District Overlookers',
   DISTRICTHQ_HEAD: 'DistrictHQ Head',
-  DEPARTMENT_USER: 'Department User',
-  DEPARTMENT_HEAD: 'Department Head',
-  DEPARTMENT_SECRETARY: 'Department Secretary',
   ADMIN: 'Admin',
-  CSD_ADMIN: 'CSDAdmin', // Citizen Service Desk Admin - verifies public users via bio-authentication
+  DISTRICT_OVERLOOKERS: 'District Overlookers',
+  CSC_ADMIN: 'CSCAdmin', // Citizen Service Desk Admin - verifies public users via bio-authentication
   SUPER_ADMIN: 'Super Admin'
 };
 
-// Role hierarchy levels for comparison (Super Admin = 1, descending; 2-8 selectable in registration)
-// Level 9 = CSDAdmin (exclusive role, assigned separately, not available in admin registration)
+// Role hierarchy levels for comparison (sequential: 1-5)
+// 1=Super Admin, 2=Admin, 3=DistrictHQ Head, 4=District Overlookers, 5=CSCAdmin
 const ROLE_LEVELS = {
   [ADMIN_ROLES.SUPER_ADMIN]: 1,
   [ADMIN_ROLES.ADMIN]: 2,
-  [ADMIN_ROLES.DEPARTMENT_SECRETARY]: 3,
-  [ADMIN_ROLES.DEPARTMENT_HEAD]: 4,
-  [ADMIN_ROLES.DEPARTMENT_USER]: 5,
-  [ADMIN_ROLES.DISTRICTHQ_HEAD]: 6,
-  [ADMIN_ROLES.DISTRICT_OVERLOOKERS]: 7,
-  [ADMIN_ROLES.POST_OPERATOR]: 8,
-  [ADMIN_ROLES.CSD_ADMIN]: 9, // Exclusive role - verifies public users; not in registration (2-8)
+  [ADMIN_ROLES.DISTRICTHQ_HEAD]: 3,
+  [ADMIN_ROLES.DISTRICT_OVERLOOKERS]: 4,
+  [ADMIN_ROLES.CSC_ADMIN]: 5, // Citizen Service Desk - verifies public users
 };
 
-// Map roleLevel (2-9) from admin registration to role string
+// Map roleLevel (2-5) from admin registration to role string
 const ROLE_LEVEL_TO_ROLE = {
   2: ADMIN_ROLES.ADMIN,
-  3: ADMIN_ROLES.DEPARTMENT_SECRETARY,
-  4: ADMIN_ROLES.DEPARTMENT_HEAD,
-  5: ADMIN_ROLES.DEPARTMENT_USER,
-  6: ADMIN_ROLES.DISTRICTHQ_HEAD,
-  7: ADMIN_ROLES.DISTRICT_OVERLOOKERS,
-  8: ADMIN_ROLES.POST_OPERATOR,
-  9: ADMIN_ROLES.CSD_ADMIN, // Citizen Service Desk - verifies public users
+  3: ADMIN_ROLES.DISTRICTHQ_HEAD,
+  4: ADMIN_ROLES.DISTRICT_OVERLOOKERS,
+  5: ADMIN_ROLES.CSC_ADMIN, // Citizen Service Desk - verifies public users
 };
 
 const adminUserSchema = new mongoose.Schema({
@@ -72,7 +60,7 @@ const adminUserSchema = new mongoose.Schema({
   role: {
     type: String,
     enum: Object.values(ADMIN_ROLES),
-    default: ADMIN_ROLES.POST_OPERATOR,
+    default: ADMIN_ROLES.DISTRICT_OVERLOOKERS,
     required: [true, 'Role is required']
   },
   department: {
@@ -115,7 +103,7 @@ const adminUserSchema = new mongoose.Schema({
 });
 
 // Instance method to check if user has required role level
-// Lower number = higher authority (Super Admin = 1, Post Operator = 8)
+// Lower number = higher authority (Super Admin = 1, CSCAdmin = 5)
 adminUserSchema.methods.hasRoleLevel = function(requiredRole) {
   const userLevel = ROLE_LEVELS[this.role] || 999; // Default to lowest if not found
   const requiredLevel = ROLE_LEVELS[requiredRole] || 999;

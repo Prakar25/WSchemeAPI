@@ -66,19 +66,22 @@ router.post("/", async (req, res) => {
       roleLevel,
     });
 
+    const userPayload = {
+      _id: user._id,
+      fullName: user.fullName,
+      username: user.username,
+      contactNumber: user.contactNumber,
+      role: user.role,
+      roleLevel: roleLevel,
+      department: user.department || null,
+      departmentId: user.departmentId || null,
+    };
     return res.status(200).json({
       status: "success",
       token,
-      user: {
-        _id: user._id,
-        fullName: user.fullName,
-        username: user.username,
-        contactNumber: user.contactNumber,
-        role: user.role,
-        roleLevel: roleLevel,
-        department: user.department || null,
-        departmentId: user.departmentId || null,
-      },
+      user: userPayload,
+      role: user.role,
+      roleLevel,
     });
   } catch (error) {
     console.error("Admin login error:", error);

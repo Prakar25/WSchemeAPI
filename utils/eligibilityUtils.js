@@ -23,7 +23,7 @@ async function hasAppliedToExcludedSchemes(userId, excludedSchemeIds) {
   const applications = await Application.find({
     user_id: userId,
     scheme_id: { $in: excludedSchemeIds },
-    status: { $in: ["Applied", "Under Review", "Approved", "Pending"] }, // Any active status
+    status: { $in: ["Applied", "Under Review", "Approved", "Pending", "Bioauthentication"] }, // Any active status
   }).select("scheme_id");
 
   const appliedSchemeIds = applications.map(app => app.scheme_id.toString());

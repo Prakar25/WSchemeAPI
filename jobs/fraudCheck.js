@@ -60,7 +60,7 @@ async function runFraudCheck() {
 
     // 2. Ineligible claims (re-check eligibility for active applications)
     const applications = await Application.find({
-      status: { $in: ["Applied", "Under Review", "Pending"] },
+      status: { $in: ["Applied", "Under Review", "Pending", "Bioauthentication"] },
     })
       .populate("user_id", "demographics economicStatus")
       .populate("scheme_id", "scheme_name scheme_eligibility gender excluded_schemes")

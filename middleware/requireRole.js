@@ -2,7 +2,7 @@
  * Role-Based Authorization Middleware
  * 
  * Checks if the authenticated admin has the required role level or higher.
- * Hierarchy: Super Admin (1) > Admin (2) > ... > Post Operator (8)
+ * Hierarchy: Super Admin (1) > Admin (2) > ... > CSCAdmin (5)
  * Lower number = Higher authority
  * Must be used after adminAuth middleware.
  */
@@ -34,7 +34,7 @@ const requireRole = (requiredRoles) => {
         : [requiredRoles];
 
       // Check if user has one of the required roles
-      // Lower number = higher authority (Super Admin = 1, Post Operator = 8)
+      // Lower number = higher authority (Super Admin = 1, CSCAdmin = 5)
       let hasAccess = false;
       let requiredLevel = 999;
 
@@ -69,7 +69,7 @@ const requireRole = (requiredRoles) => {
 
 /**
  * Middleware to require minimum role level (user must have this role or higher authority)
- * Lower number = higher authority (Super Admin = 1, Post Operator = 8)
+ * Lower number = higher authority (Super Admin = 1, CSCAdmin = 5)
  * @param {string} minimumRole - Minimum role required (user must have this or higher)
  * @returns {Function} Express middleware
  */

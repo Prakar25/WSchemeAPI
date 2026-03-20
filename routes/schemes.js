@@ -474,8 +474,8 @@ router.post("/delete", async (req, res) => {
 router.put("/:id/approve", adminAuth, requireRole([
   AdminUser.ROLES.SUPER_ADMIN,
   AdminUser.ROLES.ADMIN,
-  AdminUser.ROLES.DEPARTMENT_SECRETARY,
-  AdminUser.ROLES.DEPARTMENT_HEAD,
+  AdminUser.ROLES.DISTRICTHQ_HEAD,
+  AdminUser.ROLES.DISTRICT_OVERLOOKERS,
 ]), async (req, res) => {
   try {
     const schemeId = req.params.id;
@@ -544,8 +544,8 @@ router.put("/:id/approve", adminAuth, requireRole([
 router.put("/:id/reject", adminAuth, requireRole([
   AdminUser.ROLES.SUPER_ADMIN,
   AdminUser.ROLES.ADMIN,
-  AdminUser.ROLES.DEPARTMENT_SECRETARY,
-  AdminUser.ROLES.DEPARTMENT_HEAD,
+  AdminUser.ROLES.DISTRICTHQ_HEAD,
+  AdminUser.ROLES.DISTRICT_OVERLOOKERS,
 ]), async (req, res) => {
   try {
     const schemeId = req.params.id;

@@ -30,7 +30,7 @@ router.get("/roles/list", adminAuth, async (req, res) => {
       level: AdminUser.ROLE_LEVELS[value] || 0,
     }));
 
-    // Sort by level (ascending: Super Admin = 1 first, Post Operator = 8 last)
+    // Sort by level (ascending: Super Admin = 1 first, CSCAdmin = 5 last)
     roles.sort((a, b) => a.level - b.level);
 
     res.status(200).json({
@@ -71,9 +71,13 @@ router.get("/", adminAuth, async (req, res) => {
       });
     }
 
+    const formatted = formatAdminUser(user);
     res.status(200).json({
       status: "success",
-      user: formatAdminUser(user),
+      user: formatted,
+      // Top-level role fields for frontend (same as user.role / user.roleLevel)
+      role: formatted.role,
+      roleLevel: formatted.roleLevel,
     });
   } catch (error) {
     console.error("Error fetching admin profile:", error);

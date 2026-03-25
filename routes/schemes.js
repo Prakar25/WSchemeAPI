@@ -12,6 +12,22 @@ function titleToFieldKey(title) {
     .replace(/[^a-z0-9_]/g, "");
 }
 
+// Normalize scheme image URL for the frontend:
+// Stored DB value is often `public/uploads/...`. Many frontends then prefix `/`,
+// resulting in requests to `/public/uploads/...`. To avoid that (and prefer `/uploads/...`),
+// we strip any leading `public/` (and any leading `/`) from scheme_image_file_url.
+function normalizeSchemeImageUrl(url) {
+  if (!url || typeof url !== "string") return url;
+
+  // If it's already an absolute URL, keep as-is.
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+
+  let normalized = url;
+  if (normalized.startsWith("/")) normalized = normalized.slice(1);
+  if (normalized.startsWith("public/")) normalized = normalized.slice("public/".length);
+  return normalized;
+}
+
 // Normalize scheme_eligibility.custom_fields - form-style (label, type, required, options)
 function normalizeEligibilityCustomFields(fields) {
   if (!Array.isArray(fields)) return [];
@@ -165,7 +181,16 @@ router.get("/", async (req, res) => {
       }
     }
 
-    res.status(200).json(schemes);
+    // Normalize scheme image URLs for frontend
+    const normalizedSchemes = (schemes || []).map((scheme) => {
+      const obj = scheme?.toObject ? scheme.toObject() : scheme;
+      if (obj && obj.scheme_image_file_url) {
+        obj.scheme_image_file_url = normalizeSchemeImageUrl(obj.scheme_image_file_url);
+      }
+      return obj;
+    });
+
+    res.status(200).json(normalizedSchemes);
   } catch (error) {
     console.error("Error fetching schemes:", error);
     res.status(500).json({
@@ -228,7 +253,15 @@ router.get("/:id", async (req, res) => {
       });
     }
 
-    res.status(200).json(scheme);
+    // Normalize scheme image URL for frontend
+    const schemeObj = scheme?.toObject ? scheme.toObject() : scheme;
+    if (schemeObj && schemeObj.scheme_image_file_url) {
+      schemeObj.scheme_image_file_url = normalizeSchemeImageUrl(
+        schemeObj.scheme_image_file_url
+      );
+    }
+
+    res.status(200).json(schemeObj);
   } catch (error) {
     console.error("Error fetching scheme:", error);
     if (error.name === "CastError") {

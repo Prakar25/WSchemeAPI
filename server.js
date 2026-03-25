@@ -2,6 +2,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const path = require("path");
+const fs = require("fs");
 require("dotenv").config();
 const connectDB = require("./config/database");
 
@@ -111,14 +112,33 @@ app.use(
 );
 
 // Static file serving
+const staticUploadsHeaders = (req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "http://localhost:5173");
+  res.header("Cross-Origin-Resource-Policy", "cross-origin"); // Allow loading cross-origin images
+  next();
+};
+
+// Resolve uploads directory robustly.
+// If the server is started from `dist/server.js`, `__dirname` becomes `dist/`
+// and `dist/public/uploads` won't exist. In that case we fall back to ../public/uploads.
+const uploadsDirCandidate1 = path.join(__dirname, "public", "uploads");
+const uploadsDirCandidate2 = path.join(__dirname, "..", "public", "uploads");
+const uploadsDir = fs.existsSync(uploadsDirCandidate1)
+  ? uploadsDirCandidate1
+  : fs.existsSync(uploadsDirCandidate2)
+    ? uploadsDirCandidate2
+    : uploadsDirCandidate1;
+
+// Serve under both URL prefixes to avoid frontend/static-path mismatches.
 app.use(
   "/public/uploads",
-  (req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "http://localhost:5173");
-    res.header("Cross-Origin-Resource-Policy", "cross-origin"); // Allow loading cross-origin images
-    next();
-  },
-  express.static(path.join(__dirname, "public", "uploads"))
+  staticUploadsHeaders,
+  express.static(uploadsDir)
+);
+app.use(
+  "/uploads",
+  staticUploadsHeaders,
+  express.static(uploadsDir)
 );
 
 // Error handling middleware (must be after all routes)

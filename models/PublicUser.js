@@ -221,16 +221,16 @@ const publicUserSchema = new mongoose.Schema(
       verificationStatus: {
         type: String,
         enum: ["pending", "verified", "rejected"],
-        default: "pending", // Set to pending after profile completion, verified by CSDAdmin
+        default: "verified", // Mobile OTP registration is sufficient (no CSC verification)
       },
       verifiedBy: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "AdminUser",
-        default: null, // CSDAdmin who verified the user
+        default: null,
       },
       verifiedAt: {
         type: Date,
-        default: null, // Timestamp when verified by CSDAdmin
+        default: null,
       },
       rejectionReason: {
         type: String,

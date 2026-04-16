@@ -126,6 +126,11 @@ const sendOTP = async (mobileNumber, otp, purpose = "register") => {
   // Always log OTP to terminal for debugging
   console.log(`[OTP] ${mobileNumber} (${purpose}): ${otp}`);
 
+  // In non-production, never call real SMS provider (avoid burning credits).
+  if (process.env.NODE_ENV !== "production") {
+    return true;
+  }
+
   const smsUser = process.env.THUNDER_SMS_USER || process.env.THUNDER_SMS_MOBILE_NO;
   const hasThunderConfig =
     smsUser &&

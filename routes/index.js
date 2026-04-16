@@ -46,8 +46,8 @@ router.use("/admin-register", require("./adminRegister"));
 // Admin verification (pending-admins, verify-admin) - mount after specific /admin/* paths
 router.use("/admin", require("./adminVerification"));
 
-// CSDAdmin verification - verify public users (pending-public-users, verify-public-user)
-router.use("/csd", require("./csdVerification"));
+// CSCAdmin verification - verify public users (pending-public-users, verify-public-user)
+router.use("/csc", require("./cscVerification"));
 
 // Application routes
 router.use("/applications", require("./applications"));

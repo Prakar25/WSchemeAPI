@@ -50,7 +50,7 @@ router.get("/statistics", adminAuth, async (req, res) => {
     totalApplicants = uniqueApplicants.length;
 
     // CSC bio-auth related counts (backend aggregation for frontend "CSC Bio-auth Pending" card)
-    // "CSC review" = verification_level in [5,9] (option A: stage-based, not CSD pending logic)
+    // "CSC review" = verification_level in [5,9] (option A: stage-based, not CSC pending logic)
     const [bioauthenticationCount, cscReviewCount] = await Promise.all([
       Application.countDocuments({ status: "Bioauthentication" }),
       Application.countDocuments({

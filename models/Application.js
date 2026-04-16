@@ -26,7 +26,7 @@ const applicationSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["Applied", "Under Review", "Approved", "Rejected", "Pending", "Bioauthentication"],
+      enum: ["Applied", "Under Review", "Approved", "Rejected", "Pending", "Bioauthentication", "Benefit Transferred"],
       default: "Applied",
     },
     date_applied: {

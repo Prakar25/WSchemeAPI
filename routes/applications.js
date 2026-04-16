@@ -6,6 +6,7 @@ const PublicUser = require("../models/PublicUser");
 const AdminUser = require("../models/AdminUser");
 const { checkEligibility } = require("../utils/eligibilityUtils");
 const adminAuth = require("../middleware/adminAuth");
+const requireRole = require("../middleware/requireRole");
 const { requestOTP, verifyOTP } = require("../utils/otpService");
 
 /**
@@ -148,15 +149,12 @@ router.post("/apply", async (req, res) => {
       });
     }
 
-    // Only verified public users can apply to schemes (universal rule)
-    const verificationStatus = user.status?.verificationStatus || "pending";
-    if (verificationStatus !== "verified") {
+    // Registration is OTP-based; CSC center verification is not required to apply.
+    const verificationStatus = user.status?.verificationStatus || "verified";
+    if (verificationStatus === "rejected") {
       return res.status(403).json({
         status: "error",
-        message:
-          verificationStatus === "rejected"
-            ? "Your account verification was rejected. You cannot apply to schemes. Please contact support."
-            : "You must complete verification before applying to schemes. Please visit a CSCAdmin for bio-authentication. You can view schemes in the meantime.",
+        message: "Your account verification was rejected. You cannot apply to schemes. Please contact support.",
         verificationStatus,
       });
     }
@@ -381,6 +379,219 @@ router.post("/bioauthentication/queue", adminAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/applications/bioauthentication/requeue
+ * Move Approved / Benefit Transferred applications back to CSC for re-bioauthentication.
+ *
+ * Body: { applicationIds: string[], remarks?: string }
+ *
+ * What it does:
+ * - Sets Application.status = "Bioauthentication"
+ * - Sets Application.verification_level = 5 (CSC_Admin_Review)
+ * - Clears current_verifier
+ * - Resets associated PublicUser verificationStatus to "pending" so CSCAdmin queue can pick it up
+ * - Adds an audit entry to verification_history
+ */
+router.post("/bioauthentication/requeue", adminAuth, async (req, res) => {
+  try {
+    const { applicationIds, remarks } = req.body;
+    const admin = req.admin;
+
+    const ids = Array.isArray(applicationIds) ? applicationIds : [];
+    if (ids.length === 0) {
+      return res.status(400).json({
+        status: "error",
+        message: "applicationIds (non-empty array) is required",
+      });
+    }
+
+    // CSCAdmin should not be the one queueing bio-auth
+    if (admin?.roleLevel === 5) {
+      return res.status(403).json({
+        status: "error",
+        message: "CSCAdmin cannot requeue applications for bioauthentication.",
+      });
+    }
+
+    const ApplicationModel = require("../models/Application");
+
+    // Fetch applications + users
+    const applications = await Application.find({ _id: { $in: ids } }).populate("user_id", "status audit");
+
+    const results = {
+      updated: [],
+      skipped: [],
+    };
+
+    for (const app of applications) {
+      const user = app.user_id;
+      if (!user || !user._id) {
+        results.skipped.push({ applicationId: app._id, reason: "missing_public_user" });
+        continue;
+      }
+
+      // Only allow requeue from Approved / Benefit Transferred / Completed (99)
+      const eligible =
+        app.status === "Approved" ||
+        app.status === "Benefit Transferred" ||
+        app.verification_level === 99;
+      if (!eligible) {
+        results.skipped.push({
+          applicationId: app._id,
+          reason: "not_eligible",
+          status: app.status,
+          verification_level: app.verification_level,
+        });
+        continue;
+      }
+
+      // Skip if already in CSC bio-auth flow
+      if (app.status === "Bioauthentication" && [5, 9].includes(app.verification_level)) {
+        results.skipped.push({ applicationId: app._id, reason: "already_in_bioauthentication" });
+        continue;
+      }
+
+      const prevStage = app.verification_stage || ApplicationModel.getStageNameFromLevel(app.verification_level || 0);
+      const prevStatus = app.status || null;
+
+      // Reset PublicUser to pending so CSCAdmin can re-bio-auth
+      user.status = user.status || {};
+      user.status.verificationStatus = "pending";
+      user.status.verifiedBy = null;
+      user.status.verifiedAt = null;
+      user.status.rejectionReason = null;
+      if (user.audit) {
+        user.audit.lastUpdated = new Date();
+        user.audit.updateCount = (user.audit.updateCount || 0) + 1;
+      }
+      await user.save();
+
+      // Reset application to CSC stage for re-bioauthentication
+      app.status = "Bioauthentication";
+      app.verification_level = 5;
+      app.verification_stage = "CSC_Admin_Review";
+      app.authorization_level_index = 0;
+      app.current_verifier = {
+        verified_by: null,
+        verified_by_name: null,
+        verified_by_role: null,
+        verified_by_role_level: null,
+        remarks: null,
+        verified_at: null,
+      };
+
+      app.verification_history.push({
+        stage: prevStage,
+        verified_by: admin._id,
+        verified_by_name: admin.fullName,
+        verified_by_role: admin.role,
+        verified_by_role_level: admin.roleLevel,
+        action: "Returned",
+        remarks: `Re-bioauthentication requested (prev status: ${prevStatus || "unknown"}).${remarks ? ` ${String(remarks).trim()}` : ""}`,
+        verified_at: new Date(),
+      });
+
+      await app.save();
+      results.updated.push(app._id);
+    }
+
+    return res.status(200).json({
+      status: "success",
+      message: "Bioauthentication requeue updated",
+      data: results,
+      count: results.updated.length,
+    });
+  } catch (error) {
+    console.error("Error requeueing bioauthentication:", error);
+    return res.status(500).json({
+      status: "error",
+      message: "Failed to requeue bioauthentication",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
+  }
+});
+
+/**
+ * PUT /api/applications/:id/mark-benefit-transferred
+ * Mark an application as "Benefit Transferred".
+ *
+ * Auth: Admin/Super Admin only.
+ * Body: { remarks?: string }
+ *
+ * Notes:
+ * - Does not change verification_level/stage (it is a post-approval status marker).
+ * - Adds a verification_history entry for audit trail.
+ */
+router.put(
+  "/:id/mark-benefit-transferred",
+  adminAuth,
+  requireRole([AdminUser.ROLES.SUPER_ADMIN, AdminUser.ROLES.ADMIN]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { remarks } = req.body || {};
+      const admin = req.admin;
+
+      const application = await Application.findById(id)
+        .populate("user_id", "demographics.fullName")
+        .populate("scheme_id", "scheme_name");
+
+      if (!application) {
+        return res.status(404).json({ status: "error", message: "Application not found" });
+      }
+
+      // Only allow marking after approval (or if already marked)
+      if (application.status !== "Approved" && application.status !== "Benefit Transferred") {
+        return res.status(400).json({
+          status: "error",
+          message: 'Only "Approved" applications can be marked as "Benefit Transferred".',
+          currentStatus: application.status,
+        });
+      }
+
+      const prevStatus = application.status;
+      application.status = "Benefit Transferred";
+      if (remarks && String(remarks).trim()) {
+        application.remarks = String(remarks).trim();
+      }
+
+      // Audit entry (reuse verification_history structure)
+      const ApplicationModel = require("../models/Application");
+      const currentLevel = ApplicationModel.normalizeVerificationLevel(application.verification_level || 0);
+      application.verification_history.push({
+        stage: ApplicationModel.getStageNameFromLevel(currentLevel),
+        verification_level: currentLevel,
+        verified_by: admin._id,
+        verified_by_name: admin.fullName,
+        verified_by_role: admin.role,
+        verified_by_role_level: admin.roleLevel,
+        action: "Verified",
+        remarks: `Marked as Benefit Transferred (prev status: ${prevStatus}).${remarks && String(remarks).trim() ? ` ${String(remarks).trim()}` : ""}`,
+        verified_at: new Date(),
+      });
+
+      await application.save();
+
+      return res.status(200).json({
+        status: "success",
+        message: "Application marked as Benefit Transferred",
+        data: {
+          _id: application._id,
+          status: application.status,
+          schemeName: application.scheme_id?.scheme_name || null,
+          applicantName: application.user_id?.demographics?.fullName || null,
+        },
+      });
+    } catch (error) {
+      console.error("Error marking Benefit Transferred:", error);
+      if (error.name === "CastError") {
+        return res.status(400).json({ status: "error", message: "Invalid application ID" });
+      }
+      return res.status(500).json({ status: "error", message: "Failed to mark Benefit Transferred" });
+    }
+  }
+);
+
 // GET /api/applications - Get applications (with filters)
 // All admins can VIEW applications, but department filtering applies:
 // - Secretary (level 3) and above (Admin level 2, Super Admin level 1) can view ALL departments
@@ -395,6 +606,7 @@ router.get("/", adminAuth, async (req, res) => {
       verification_level,
       assigned_to_me,
       search,
+      district,
     } = req.query;
     const adminRoleLevel = req.admin.roleLevel;
     const adminDepartmentId = req.admin.departmentId;
@@ -408,6 +620,7 @@ router.get("/", adminAuth, async (req, res) => {
       if (s === "applied") return "Applied";
       if (s === "under review" || s === "under_review") return "Under Review";
       if (s === "approved") return "Approved";
+      if (s === "benefit transferred" || s === "benefit_transferred" || s === "benefit-transferred") return "Benefit Transferred";
       if (s === "rejected") return "Rejected";
       if (s === "pending") return "Pending";
       if (s === "bioauthentication" || s === "bio-authentication" || s === "bio_authentication")
@@ -443,6 +656,30 @@ router.get("/", adminAuth, async (req, res) => {
       if (levels.length > 0) query.verification_level = levels.length === 1 ? levels[0] : { $in: levels };
     }
 
+    // Optional district filter (applicant's district from PublicUser.address.district)
+    // Accepted values (canonical list): Gangtok, Gyalshing, Mangan, Namchi, Pakyong, Soreng
+    // Matching is case-insensitive and exact by default.
+    if (district && String(district).trim().length > 0) {
+      const d = String(district).trim();
+      const districtRegex = new RegExp(`^${d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+      const districtUsers = await PublicUser.find({ "address.district": districtRegex }).select("_id");
+      const districtUserIds = districtUsers.map((u) => u._id);
+      // If there are no users in this district, return empty result set quickly.
+      if (districtUserIds.length === 0) {
+        return res.status(200).json({ status: "success", data: [], count: 0 });
+      }
+      // If an explicit user_id is provided, ensure it belongs to this district.
+      if (query.user_id) {
+        const explicitId = String(query.user_id);
+        const allowed = new Set(districtUserIds.map((id) => String(id)));
+        if (!allowed.has(explicitId)) {
+          return res.status(200).json({ status: "success", data: [], count: 0 });
+        }
+      } else {
+        query.user_id = { $in: districtUserIds };
+      }
+    }
+
     // Optional search text across:
     // - PublicUser.demographics.fullName
     // - PublicUser.aadhaarNumber
@@ -468,7 +705,17 @@ router.get("/", adminAuth, async (req, res) => {
       const schemeIds = schemeMatches.map((s) => s._id);
 
       const orConditions = [];
-      if (userIds.length > 0) orConditions.push({ user_id: { $in: userIds } });
+      // If district filter already constrained user_id, intersect with search userIds (to keep results correct).
+      if (userIds.length > 0) {
+        const existingUserIdFilter = query.user_id && typeof query.user_id === "object" ? query.user_id : null;
+        if (existingUserIdFilter && Array.isArray(existingUserIdFilter.$in)) {
+          const allowed = new Set(existingUserIdFilter.$in.map((id) => String(id)));
+          const intersected = userIds.filter((id) => allowed.has(String(id)));
+          if (intersected.length > 0) orConditions.push({ user_id: { $in: intersected } });
+        } else {
+          orConditions.push({ user_id: { $in: userIds } });
+        }
+      }
       if (schemeIds.length > 0) orConditions.push({ scheme_id: { $in: schemeIds } });
 
       // If no matches for search term, return empty result set.
@@ -550,6 +797,7 @@ router.get("/", adminAuth, async (req, res) => {
 router.get("/scheme/:scheme_id", async (req, res) => {
   try {
     const { scheme_id } = req.params;
+    const { district, search } = req.query;
 
     // Check if scheme exists
     const scheme = await Scheme.findById(scheme_id);
@@ -560,8 +808,85 @@ router.get("/scheme/:scheme_id", async (req, res) => {
       });
     }
 
+    // Optional district filter: applicant's PublicUser.address.district
+    // Optional search: matches PublicUser (name/aadhaar/mobile) within this scheme
+    let userIdConstraint = null; // { $in: ObjectId[] } or null
+    if (district && String(district).trim().length > 0) {
+      const d = String(district).trim();
+      const districtRegex = new RegExp(`^${d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+      const users = await PublicUser.find({ "address.district": districtRegex }).select("_id");
+      const ids = users.map((u) => u._id);
+      if (ids.length === 0) {
+        return res.status(200).json({
+          status: "success",
+          scheme: {
+            _id: scheme._id,
+            scheme_name: scheme.scheme_name,
+            category: scheme.category,
+            department: scheme.department,
+          },
+          applicants: [],
+          total_applicants: 0,
+          count_by_status: { Applied: 0, "Under Review": 0, Approved: 0, Rejected: 0, Pending: 0 },
+        });
+      }
+      userIdConstraint = { $in: ids };
+    }
+
+    if (search && String(search).trim().length > 0) {
+      const term = String(search).trim();
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const regex = new RegExp(escaped, "i");
+      const users = await PublicUser.find({
+        $or: [
+          { "demographics.fullName": regex },
+          { aadhaarNumber: regex },
+          { "contact.mobile.value": regex },
+        ],
+      }).select("_id");
+      const ids = users.map((u) => u._id);
+      if (ids.length === 0) {
+        return res.status(200).json({
+          status: "success",
+          scheme: {
+            _id: scheme._id,
+            scheme_name: scheme.scheme_name,
+            category: scheme.category,
+            department: scheme.department,
+          },
+          applicants: [],
+          total_applicants: 0,
+          count_by_status: { Applied: 0, "Under Review": 0, Approved: 0, Rejected: 0, Pending: 0 },
+        });
+      }
+      if (userIdConstraint && Array.isArray(userIdConstraint.$in)) {
+        const allowed = new Set(userIdConstraint.$in.map((id) => String(id)));
+        const intersected = ids.filter((id) => allowed.has(String(id)));
+        if (intersected.length === 0) {
+          return res.status(200).json({
+            status: "success",
+            scheme: {
+              _id: scheme._id,
+              scheme_name: scheme.scheme_name,
+              category: scheme.category,
+              department: scheme.department,
+            },
+            applicants: [],
+            total_applicants: 0,
+            count_by_status: { Applied: 0, "Under Review": 0, Approved: 0, Rejected: 0, Pending: 0 },
+          });
+        }
+        userIdConstraint = { $in: intersected };
+      } else {
+        userIdConstraint = { $in: ids };
+      }
+    }
+
     // Find all applications for this scheme
-    const applications = await Application.find({ scheme_id })
+    const appQuery = { scheme_id };
+    if (userIdConstraint) appQuery.user_id = userIdConstraint;
+
+    const applications = await Application.find(appQuery)
       .populate("user_id", "demographics.fullName demographics.gender demographics.dob aadhaarNumber contact address")
       .populate({
         path: "scheme_id",
@@ -610,6 +935,7 @@ router.get("/scheme/:scheme_id", async (req, res) => {
         Applied: applicants.filter(a => a.status === "Applied").length,
         "Under Review": applicants.filter(a => a.status === "Under Review").length,
         Approved: applicants.filter(a => a.status === "Approved").length,
+        "Benefit Transferred": applicants.filter(a => a.status === "Benefit Transferred").length,
         Rejected: applicants.filter(a => a.status === "Rejected").length,
         Pending: applicants.filter(a => a.status === "Pending").length,
       },
@@ -1093,12 +1419,20 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
       const isCscAdmin = adminRoleLevel === 5;
       let message = `You don't have permission to verify applications at verification level ${currentLevel}. Required role levels: ${requiredRoleLevels.join(", ")}`;
       let reason = "role_mismatch";
+      let statusCode = 403;
+
+      if (currentLevel === 99) {
+        message = "This application is already completed.";
+        reason = "already_completed";
+        statusCode = 409;
+      }
       if (isCscAdmin && !isCscStage) {
         message =
           "This application is not at CSC Admin (bio-auth) stage. Only applications pending CSC verification can be verified by CSC Admin.";
         reason = "application_not_at_csc_stage";
+        statusCode = 403;
       }
-      return res.status(403).json({
+      return res.status(statusCode).json({
         status: "error",
         reason,
         message,

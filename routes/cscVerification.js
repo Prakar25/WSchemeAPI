@@ -8,19 +8,19 @@ const adminAuth = require("../middleware/adminAuth");
 /**
  * Require CSCAdmin role to access CSC verification endpoints
  */
-const requireCsdAdmin = (req, res, next) => {
+const requireCscAdmin = (req, res, next) => {
   const role = req.admin?.role;
   if (role === AdminUser.ROLES.CSC_ADMIN) {
     return next();
   }
-    return res.status(403).json({
+  return res.status(403).json({
     status: "error",
     message: "Only CSCAdmin can access this resource",
   });
 };
 
 /**
- * GET /api/csd/pending-applications
+ * GET /api/csc/pending-applications
  * Paginated application list for CSC admin.
  * Query:
  *  - page (default 1)
@@ -36,7 +36,7 @@ const requireCsdAdmin = (req, res, next) => {
  * Default behavior (without aadhaarNumber): returns CSC pending + approved.
  * Requires: admin auth, CSCAdmin role
  */
-router.get("/pending-applications", adminAuth, requireCsdAdmin, async (req, res) => {
+router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res) => {
   try {
     const page = Math.max(parseInt(String(req.query.page || "1"), 10) || 1, 1);
     const rawLimit = parseInt(String(req.query.limit || "20"), 10) || 20;
@@ -148,7 +148,10 @@ router.get("/pending-applications", adminAuth, requireCsdAdmin, async (req, res)
 
     const [applications, total] = await Promise.all([
       Application.find(query)
-        .populate("user_id", "aadhaarNumber demographics.fullName demographics.gender contact.mobile.value contact.email.value status.verificationStatus")
+        .populate(
+          "user_id",
+          "aadhaarNumber demographics.fullName demographics.gender contact.mobile.value contact.email.value status.verificationStatus"
+        )
         .populate("scheme_id", "scheme_name department category")
         .sort({ date_applied: -1 })
         .skip(skip)
@@ -222,11 +225,11 @@ router.get("/pending-applications", adminAuth, requireCsdAdmin, async (req, res)
 });
 
 /**
- * GET /api/csd/pending-public-users
+ * GET /api/csc/pending-public-users
  * List public users with verificationStatus "pending" (for CSCAdmin)
  * Requires: admin auth (x-admin-username, x-admin-password), CSCAdmin role
  */
-router.get("/pending-public-users", adminAuth, requireCsdAdmin, async (req, res) => {
+router.get("/pending-public-users", adminAuth, requireCscAdmin, async (req, res) => {
   try {
     const users = await PublicUser.find({ "status.verificationStatus": "pending" })
       .select(
@@ -263,7 +266,7 @@ router.get("/pending-public-users", adminAuth, requireCsdAdmin, async (req, res)
 });
 
 /**
- * POST /api/csd/verify-public-user
+ * POST /api/csc/verify-public-user
  * Approve or reject a pending public user (CSCAdmin only)
  *
  * Body: {
@@ -272,7 +275,7 @@ router.get("/pending-public-users", adminAuth, requireCsdAdmin, async (req, res)
  *   rejectionReason?: string  // optional, for action "reject"
  * }
  */
-router.post("/verify-public-user", adminAuth, requireCsdAdmin, async (req, res) => {
+router.post("/verify-public-user", adminAuth, requireCscAdmin, async (req, res) => {
   try {
     const { userId, action, rejectionReason } = req.body;
 
@@ -307,12 +310,12 @@ router.post("/verify-public-user", adminAuth, requireCsdAdmin, async (req, res) 
       });
     }
 
-    const csdAdminId = req.admin._id;
+    const cscAdminId = req.admin._id;
 
     if (actionLower === "approve") {
       user.status = user.status || {};
       user.status.verificationStatus = "verified";
-      user.status.verifiedBy = csdAdminId;
+      user.status.verifiedBy = cscAdminId;
       user.status.verifiedAt = new Date();
       user.status.rejectionReason = null;
     } else {
@@ -340,10 +343,13 @@ router.post("/verify-public-user", adminAuth, requireCsdAdmin, async (req, res) 
         app.status = "Approved";
         app.verification_level = 99;
         app.verification_stage = "Completed";
-        app.authorization_level_index = Array.isArray(app.authorization_levels) && app.authorization_levels.length > 0 ? app.authorization_levels.length - 1 : 0;
+        app.authorization_level_index =
+          Array.isArray(app.authorization_levels) && app.authorization_levels.length > 0
+            ? app.authorization_levels.length - 1
+            : 0;
 
         app.current_verifier = {
-          verified_by: csdAdminId,
+          verified_by: cscAdminId,
           verified_by_name: req.admin.fullName,
           verified_by_role: req.admin.role,
           verified_by_role_level: req.admin.roleLevel,
@@ -354,7 +360,7 @@ router.post("/verify-public-user", adminAuth, requireCsdAdmin, async (req, res) 
         // Keep verification history consistent: CSC bio-auth + completion
         app.verification_history.push({
           stage: ApplicationModel.getStageNameFromLevel(5),
-          verified_by: csdAdminId,
+          verified_by: cscAdminId,
           verified_by_name: req.admin.fullName,
           verified_by_role: req.admin.role,
           verified_by_role_level: req.admin.roleLevel,
@@ -365,7 +371,7 @@ router.post("/verify-public-user", adminAuth, requireCsdAdmin, async (req, res) 
 
         app.verification_history.push({
           stage: "Completed",
-          verified_by: csdAdminId,
+          verified_by: cscAdminId,
           verified_by_name: req.admin.fullName,
           verified_by_role: req.admin.role,
           verified_by_role_level: req.admin.roleLevel,
@@ -374,7 +380,7 @@ router.post("/verify-public-user", adminAuth, requireCsdAdmin, async (req, res) 
           verified_at: new Date(),
         });
 
-        app.reviewed_by = csdAdminId;
+        app.reviewed_by = cscAdminId;
         app.reviewed_at = new Date();
 
         await app.save();
@@ -397,16 +403,18 @@ router.post("/verify-public-user", adminAuth, requireCsdAdmin, async (req, res) 
 
         app.verification_history.push({
           stage: ApplicationModel.getStageNameFromLevel(5),
-          verified_by: csdAdminId,
+          verified_by: cscAdminId,
           verified_by_name: req.admin.fullName,
           verified_by_role: req.admin.role,
           verified_by_role_level: req.admin.roleLevel,
           action: "Rejected",
-          remarks: rejectionReason ? `Bioauthentication rejected: ${String(rejectionReason).trim()}` : "Bioauthentication rejected by CSCAdmin",
+          remarks: rejectionReason
+            ? `Bioauthentication rejected: ${String(rejectionReason).trim()}`
+            : "Bioauthentication rejected by CSCAdmin",
           verified_at: new Date(),
         });
 
-        app.reviewed_by = csdAdminId;
+        app.reviewed_by = cscAdminId;
         app.reviewed_at = new Date();
 
         await app.save();

@@ -124,7 +124,10 @@ router.post("/register/verify-otp", async (req, res) => {
       status: {
         isActive: true,
         isDeactivated: false,
-        verificationStatus: "pending", // Pending bio-authentication by CSDAdmin
+        verificationStatus: "verified", // OTP is sufficient; no CSC verification required
+        verifiedBy: null,
+        verifiedAt: new Date(),
+        rejectionReason: null,
       },
       authentication: {
         lastAuthAt: new Date(),

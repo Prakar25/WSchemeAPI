@@ -1,52 +1,45 @@
-const PublicUser = require("../models/PublicUser");
+const { assertApplicantAllowedForSession } = require("../utils/applicantResolver");
+const { resolvePublicUserSessionFromRequest } = require("../utils/publicSessionAnchor");
 
 /**
- * Middleware to identify logged-in public user
- * Accepts userId and/or mobileNumber from query params and/or request body.
- * No custom headers required.
+ * Identify the logged-in OTP account and optional "acting as" applicant.
  *
- * - GET: query params { userId } or { mobileNumber }
- * - PUT/DELETE: query params and/or body { userId }, { mobileNumber }
- * - POST (multipart): query params only (body not parsed until multer runs)
+ * Session anchor (one required): `publicUserId` (PublicUser _id from login) OR `mobileNumber`
+ * in query and/or body. Aliases: `accountId`, `sessionUserId`.
+ * For multipart routes, put the anchor + optional `userId` in the query string.
+ *
+ * Optional `userId`: PublicUser._id (same account) or BeneficiaryPerson._id in this household.
  */
 const publicUserAuth = async (req, res, next) => {
   try {
-    // Accept from query and/or body (body available for JSON requests only)
-    const userId = req.query?.userId ?? req.body?.userId;
-    const mobileNumber = req.query?.mobileNumber ?? req.body?.mobileNumber;
+    const requestedApplicantId = req.query?.userId ?? req.body?.userId;
 
-    if (!userId && !mobileNumber) {
-      return res.status(401).json({
-        status: "error",
-        message: "User identification required. Please provide userId or mobileNumber in query params or request body.",
-      });
+    const session = await resolvePublicUserSessionFromRequest(req);
+    if (!session.ok) {
+      return res.status(session.status).json({ status: "error", message: session.message });
+    }
+    const sessionUser = session.publicUser;
+
+    let beneficiaryPerson = null;
+
+    if (requestedApplicantId) {
+      const assert = await assertApplicantAllowedForSession(sessionUser, requestedApplicantId);
+      if (!assert.ok) {
+        return res.status(assert.status).json({ status: "error", message: assert.message });
+      }
+      if (assert.resolved.kind === "BeneficiaryPerson") {
+        beneficiaryPerson = assert.resolved.person;
+      }
+      if (process.env.LOG_PUBLIC_APPLICANT_SESSION === "1") {
+        console.log(
+          `[publicUserAuth] account=${sessionUser._id} actingAs=${requestedApplicantId} kind=${assert.resolved.kind}`
+        );
+      }
     }
 
-    let user;
-    if (userId) {
-      user = await PublicUser.findById(userId);
-    } else if (mobileNumber) {
-      user = await PublicUser.findOne({ "contact.mobile.value": mobileNumber.trim() });
-    }
-
-    if (!user) {
-      return res.status(404).json({
-        status: "error",
-        message: "User not found.",
-      });
-    }
-
-    // Check if user is active
-    if (!user.status?.isActive || user.status?.isDeactivated) {
-      return res.status(403).json({
-        status: "error",
-        message: "Your account is inactive. Please contact support.",
-      });
-    }
-
-    // Attach user to request object
-    req.publicUser = user;
-    req.userId = user._id;
+    req.publicUser = sessionUser;
+    req.beneficiaryPerson = beneficiaryPerson;
+    req.userId = beneficiaryPerson?._id || sessionUser._id;
     next();
   } catch (error) {
     console.error("Public user auth middleware error:", error);

@@ -267,6 +267,14 @@ const publicUserSchema = new mongoose.Schema(
         default: [],
       },
     },
+    /** Links this login account to a Household (Option A: multiple Aadhaars per mobile). */
+    householdId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Household",
+      default: null,
+      sparse: true,
+      unique: true,
+    },
   },
   {
     timestamps: false, // We're using custom audit timestamps

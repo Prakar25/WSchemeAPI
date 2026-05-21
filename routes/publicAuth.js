@@ -4,6 +4,8 @@ const PublicUser = require("../models/PublicUser");
 const { requestOTP, verifyOTP } = require("../utils/otpService");
 const { getAccountStatusMessage } = require("../utils/publicUserMessages");
 const crypto = require("crypto");
+const { ensureHouseholdForPublicUser, syncHouseholdFromPublicUser } = require("../utils/householdService");
+const BeneficiaryPerson = require("../models/BeneficiaryPerson");
 
 /**
  * POST /api/public-auth/register/send-otp
@@ -137,18 +139,27 @@ router.post("/register/verify-otp", async (req, res) => {
 
     await newUser.save();
 
+    await ensureHouseholdForPublicUser(newUser);
+    const refreshed = await PublicUser.findById(newUser._id);
+    const primary = refreshed?.householdId
+      ? await BeneficiaryPerson.findOne({ householdId: refreshed.householdId, isPrimary: true }).select("_id")
+      : null;
+
     // Return user data (without sensitive info)
-    const verificationStatus = newUser.status?.verificationStatus || "pending";
+    const verificationStatus = refreshed.status?.verificationStatus || "pending";
     const responseUser = {
-      _id: newUser._id,
-      userId: newUser._id,
-      fullName: newUser.demographics?.fullName || null,
-      contactEmail: newUser.contact?.email?.value || null,
-      phoneNumber: newUser.contact?.mobile?.value || null,
-      address: newUser.address || null,
-      dob: newUser.demographics?.dob?.date || null,
-      aadhaarNumber: newUser.aadhaarNumber || null,
-      gender: newUser.demographics?.gender || null,
+      _id: refreshed._id,
+      userId: refreshed._id,
+      publicUserId: refreshed._id,
+      householdId: refreshed.householdId || null,
+      primaryBeneficiaryPersonId: primary?._id || null,
+      fullName: refreshed.demographics?.fullName || null,
+      contactEmail: refreshed.contact?.email?.value || null,
+      phoneNumber: refreshed.contact?.mobile?.value || null,
+      address: refreshed.address || null,
+      dob: refreshed.demographics?.dob?.date || null,
+      aadhaarNumber: refreshed.aadhaarNumber || null,
+      gender: refreshed.demographics?.gender || null,
       verificationStatus,
       accountStatusMessage: getAccountStatusMessage(verificationStatus),
     };
@@ -295,18 +306,28 @@ router.post("/login/verify-otp", async (req, res) => {
     }
     await user.save();
 
+    await ensureHouseholdForPublicUser(user);
+    await syncHouseholdFromPublicUser(user);
+    const refreshed = await PublicUser.findById(user._id);
+    const primary = refreshed?.householdId
+      ? await BeneficiaryPerson.findOne({ householdId: refreshed.householdId, isPrimary: true }).select("_id")
+      : null;
+
     // Return user data (without sensitive info)
-    const verificationStatus = user.status?.verificationStatus || "pending";
+    const verificationStatus = refreshed.status?.verificationStatus || "pending";
     const responseUser = {
-      _id: user._id,
-      userId: user._id,
-      fullName: user.demographics?.fullName || null,
-      contactEmail: user.contact?.email?.value || null,
-      phoneNumber: user.contact?.mobile?.value || null,
-      address: user.address || null,
-      dob: user.demographics?.dob?.date || null,
-      aadhaarNumber: user.aadhaarNumber || null,
-      gender: user.demographics?.gender || null,
+      _id: refreshed._id,
+      userId: refreshed._id,
+      publicUserId: refreshed._id,
+      householdId: refreshed.householdId || null,
+      primaryBeneficiaryPersonId: primary?._id || null,
+      fullName: refreshed.demographics?.fullName || null,
+      contactEmail: refreshed.contact?.email?.value || null,
+      phoneNumber: refreshed.contact?.mobile?.value || null,
+      address: refreshed.address || null,
+      dob: refreshed.demographics?.dob?.date || null,
+      aadhaarNumber: refreshed.aadhaarNumber || null,
+      gender: refreshed.demographics?.gender || null,
       verificationStatus,
       accountStatusMessage: getAccountStatusMessage(verificationStatus),
     };

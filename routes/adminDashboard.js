@@ -3,9 +3,25 @@ const router = express.Router();
 const Application = require("../models/Application");
 const Scheme = require("../models/Scheme");
 const PublicUser = require("../models/PublicUser");
+const BeneficiaryPerson = require("../models/BeneficiaryPerson");
 const FraudCheckRun = require("../models/FraudCheckRun");
 const adminAuth = require("../middleware/adminAuth");
 const { checkEligibility } = require("../utils/eligibilityUtils");
+const { populateApplicant } = require("../utils/populateApplicant");
+const {
+  resolveApplicantById,
+  toEligibilitySubject,
+  getApplicantIdsForExcludedSchemesCheck,
+} = require("../utils/applicantResolver");
+
+async function applicantDisplayName(userId) {
+  if (!userId) return "Unknown";
+  const bp = await BeneficiaryPerson.findById(userId).select("demographics.fullName");
+  if (bp) return bp.demographics?.fullName || "Unknown";
+  const u = await PublicUser.findById(userId).select("demographics.fullName");
+  if (u) return u.demographics?.fullName || "Unknown";
+  return "Unknown";
+}
 
 // 1. Dashboard Statistics API
 // GET /api/admin/dashboard/statistics
@@ -224,9 +240,7 @@ router.get("/fraud-alerts", adminAuth, async (req, res) => {
       ]);
 
       for (const dup of duplicates) {
-        const user = await PublicUser.findById(dup._id.user_id).select(
-          "demographics.fullName"
-        );
+        const applicantName = await applicantDisplayName(dup._id.user_id);
         const scheme = await Scheme.findById(dup._id.scheme_id).select(
           "scheme_name"
         );
@@ -240,8 +254,8 @@ router.get("/fraud-alerts", adminAuth, async (req, res) => {
           alertId: `dup_${latestApp._id}`,
           type: "duplicate",
           title: "Duplicate Application",
-          description: `Duplicate application detected for applicant: ${user?.demographics?.fullName || "Unknown"}`,
-          applicantName: user?.demographics?.fullName || "Unknown",
+          description: `Duplicate application detected for applicant: ${applicantName}`,
+          applicantName,
           applicantId: dup._id.user_id.toString(),
           applicationId: latestApp._id.toString(),
           schemeId: dup._id.scheme_id.toString(),
@@ -259,7 +273,7 @@ router.get("/fraud-alerts", adminAuth, async (req, res) => {
       const applications = await Application.find({
         status: { $in: ["Applied", "Under Review", "Pending", "Bioauthentication"] },
       })
-        .populate("user_id", "demographics economicStatus")
+        .populate(populateApplicant("demographics economicStatus"))
         .populate("scheme_id", "scheme_name scheme_eligibility gender excluded_schemes")
         .limit(limitNum * 2) // Get more to filter
         .sort({ createdAt: -1 });
@@ -267,10 +281,14 @@ router.get("/fraud-alerts", adminAuth, async (req, res) => {
       for (const app of applications) {
         if (!app.user_id || !app.scheme_id) continue;
 
+        const resolved = await resolveApplicantById(app.user_id._id);
+        const subject = toEligibilitySubject(resolved);
+        if (!subject) continue;
+
         const eligibilityResult = await checkEligibility(
-          app.user_id, 
-          app.scheme_id, 
-          app.user_id._id.toString()
+          subject,
+          app.scheme_id,
+          getApplicantIdsForExcludedSchemesCheck(resolved)
         );
 
         if (!eligibilityResult.eligible) {

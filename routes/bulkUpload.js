@@ -11,10 +11,17 @@ const adminAuth = require("../middleware/adminAuth");
 const requireRole = require("../middleware/requireRole");
 const AdminUser = require("../models/AdminUser");
 const PublicUser = require("../models/PublicUser");
+const BeneficiaryPerson = require("../models/BeneficiaryPerson");
+const Household = require("../models/Household");
 const Application = require("../models/Application");
 const Scheme = require("../models/Scheme");
 const ApplicationModel = require("../models/Application");
 const { hasAppliedToExcludedSchemes } = require("../utils/eligibilityUtils");
+const {
+  ensureHouseholdForPublicUser,
+  syncHouseholdFromPublicUser,
+  md5Hex,
+} = require("../utils/householdService");
 
 // Ensure temp directory exists
 const tempDir = path.join(__dirname, "..", "temp");
@@ -277,52 +284,141 @@ function mapRowToUser(row) {
   };
 }
 
-/**
- * Helper function to find or create user
- */
-async function findOrCreateUser(userData, streetForMatching) {
-  try {
-    // First, try to find by Aadhaar
-    let user = await PublicUser.findOne({ aadhaarNumber: userData.aadhaarNumber });
-
-    if (user) {
-      // User exists - update if needed
-      // You can add update logic here if needed
-      return { user, isNew: false };
-    }
-
-    // Try to find by street address if provided
-    if (streetForMatching) {
-      user = await PublicUser.findOne({
-        "address.street": streetForMatching,
-        "demographics.fullName": userData.demographics.fullName,
-      });
-
-      if (user) {
-        // Update Aadhaar if not set
-        if (!user.aadhaarNumber) {
-          user.aadhaarNumber = userData.aadhaarNumber;
-          user.aadhaarHash = userData.aadhaarHash;
-          await user.save();
+function beneficiaryPayloadFromMapped(mapped) {
+  return {
+    aadhaarNumber: mapped.aadhaarNumber,
+    aadhaarHash: md5Hex(mapped.aadhaarNumber),
+    demographics: mapped.demographics,
+    address: mapped.address,
+    contact: mapped.contact?.email?.value
+      ? {
+          email: {
+            value: mapped.contact.email.value,
+            verified: !!mapped.contact.email.verified,
+          },
         }
-        return { user, isNew: false };
-      }
-    }
+      : {},
+    kycLevel: mapped.kycLevel || "BASIC",
+  };
+}
 
-    // Create new user
-    user = new PublicUser(userData);
-    await user.save();
-    return { user, isNew: true };
-  } catch (error) {
-    if (error.code === 11000) {
-      // Duplicate key error - try to find existing user
-      const existingUser = await PublicUser.findOne({ aadhaarNumber: userData.aadhaarNumber });
-      if (existingUser) {
-        return { user: existingUser, isNew: false };
-      }
-    }
-    throw error;
+/**
+ * Applicant ObjectIds that may already have applications for this scheme (BeneficiaryPerson, legacy PublicUser by Aadhaar, OTP account, or empty primary slot).
+ */
+async function getBulkApplicationOwnerIds(publicUser, mapped) {
+  const ids = new Set();
+  const globalBp = await BeneficiaryPerson.findOne({ aadhaarNumber: mapped.aadhaarNumber });
+  if (globalBp) ids.add(globalBp._id);
+  const legacyPu = await PublicUser.findOne({ aadhaarNumber: mapped.aadhaarNumber });
+  if (legacyPu) ids.add(legacyPu._id);
+  if (publicUser?._id) ids.add(publicUser._id);
+  if (publicUser?.householdId && !globalBp) {
+    const primary = await BeneficiaryPerson.findOne({
+      householdId: publicUser.householdId,
+      isPrimary: true,
+    });
+    if (primary && !primary.aadhaarNumber) ids.add(primary._id);
   }
+  return Array.from(ids);
+}
+
+async function findOrCreatePublicUserByMobileForBulk(mapped) {
+  const mobile = mapped.contact.mobile.value;
+  let pu = await PublicUser.findOne({ "contact.mobile.value": mobile });
+  if (pu) return { publicUser: pu, isNew: false };
+
+  const doc = {
+    contact: mapped.contact,
+    demographics: {
+      fullName: mapped.demographics.fullName,
+      dob: mapped.demographics.dob,
+      gender: mapped.demographics.gender,
+      photo: mapped.demographics.photo,
+    },
+    address: mapped.address,
+    biometrics: mapped.biometrics,
+    status: {
+      isActive: true,
+      isDeactivated: false,
+      reason: null,
+      verificationStatus: "verified",
+      verifiedBy: "bulk_upload",
+      verifiedAt: new Date(),
+    },
+    kycLevel: mapped.kycLevel || "BASIC",
+    audit: mapped.audit,
+    authentication: mapped.authentication,
+  };
+  pu = await PublicUser.create(doc);
+  return { publicUser: pu, isNew: true };
+}
+
+/**
+ * Ensure BeneficiaryPerson for this row under the OTP account (household). Aadhaar lives on persons, not on PublicUser.
+ */
+async function ensureBeneficiaryPersonForBulk(publicUser, mapped) {
+  await ensureHouseholdForPublicUser(publicUser);
+  await syncHouseholdFromPublicUser(publicUser);
+  const fresh = await PublicUser.findById(publicUser._id);
+  const hid = fresh?.householdId;
+  if (!hid) {
+    return { error: "Could not create household for this mobile number" };
+  }
+
+  const globalBp = await BeneficiaryPerson.findOne({ aadhaarNumber: mapped.aadhaarNumber });
+  if (globalBp) {
+    if (String(globalBp.householdId) !== String(hid)) {
+      return {
+        error:
+          "This Aadhaar is already registered to another mobile/household. Use the correct mobile for that beneficiary.",
+      };
+    }
+    const payload = beneficiaryPayloadFromMapped(mapped);
+    Object.assign(globalBp, payload);
+    globalBp.audit.lastUpdated = new Date();
+    globalBp.audit.updateCount = (globalBp.audit.updateCount || 0) + 1;
+    await globalBp.save();
+    return { person: globalBp, isNewPerson: false };
+  }
+
+  const primary = await BeneficiaryPerson.findOne({ householdId: hid, isPrimary: true });
+  if (primary && !primary.aadhaarNumber) {
+    const payload = beneficiaryPayloadFromMapped(mapped);
+    Object.assign(primary, payload);
+    primary.audit.lastUpdated = new Date();
+    primary.audit.updateCount = (primary.audit.updateCount || 0) + 1;
+    await primary.save();
+    return { person: primary, isNewPerson: false };
+  }
+
+  const person = await BeneficiaryPerson.create({
+    householdId: hid,
+    isPrimary: false,
+    relationToPrimary: "member",
+    ...beneficiaryPayloadFromMapped(mapped),
+    audit: {
+      createdAt: new Date(),
+      lastUpdated: new Date(),
+      updateCount: 0,
+    },
+  });
+  return { person, isNewPerson: true };
+}
+
+async function bulkAadhaarCrossHouseholdConflictPreview(publicUser, mapped) {
+  const globalBp = await BeneficiaryPerson.findOne({ aadhaarNumber: mapped.aadhaarNumber });
+  if (!globalBp) return null;
+  const h = await Household.findById(globalBp.householdId).select("publicUserId");
+  const ownerPuId = h?.publicUserId;
+  if (!ownerPuId) return null;
+  if (!publicUser || String(ownerPuId) !== String(publicUser._id)) {
+    return {
+      rowError:
+        "This Aadhaar is already linked to another mobile/household. Use the correct mobile for that beneficiary.",
+      type: "aadhaar_other_household",
+    };
+  }
+  return null;
 }
 
 /**
@@ -443,48 +539,55 @@ router.post(
           // Track this Aadhaar number
           aadhaarTracker.set(aadhaarNumber, { row: rowNumber, fullName: mapped.demographics.fullName });
 
-          // Check if user already has an application for this scheme in database
-          const existingUser = await PublicUser.findOne({
-            aadhaarNumber: aadhaarNumber,
+          const puByMobile = await PublicUser.findOne({
+            "contact.mobile.value": mapped.contact.mobile.value,
           });
 
-          let existingApplication = null;
-          if (existingUser) {
-            existingApplication = await Application.findOne({
-              user_id: existingUser._id,
-              scheme_id: scheme_id,
+          const crossHousehold = await bulkAadhaarCrossHouseholdConflictPreview(puByMobile, mapped);
+          if (crossHousehold) {
+            redundancies.push({
+              row: rowNumber,
+              aadhaarNumber: aadhaarNumber,
+              fullName: mapped.demographics.fullName,
+              error: crossHousehold.rowError,
+              type: crossHousehold.type,
             });
+            continue;
+          }
 
-            // Check if user has applied to excluded schemes (scheme conflict check)
-            if (scheme.excluded_schemes && scheme.excluded_schemes.length > 0) {
-              const excludedCheck = await hasAppliedToExcludedSchemes(
-                existingUser._id,
-                scheme.excluded_schemes
-              );
+          const ownerIds = await getBulkApplicationOwnerIds(puByMobile, mapped);
 
-              if (excludedCheck.hasApplied) {
-                // Get scheme names for better error message
-                const excludedSchemeNames = await Scheme.find({
-                  _id: { $in: excludedCheck.appliedSchemeIds },
-                }).select("scheme_name");
+          const existingApplication =
+            ownerIds.length > 0
+              ? await Application.findOne({
+                  user_id: { $in: ownerIds },
+                  scheme_id: scheme_id,
+                })
+              : null;
 
-                redundancies.push({
-                  row: rowNumber,
-                  aadhaarNumber: aadhaarNumber,
-                  fullName: mapped.demographics.fullName,
-                  error: `Scheme conflict: This user is already enrolled in incompatible scheme(s): ${excludedSchemeNames.map(s => s.scheme_name).join(", ")}. Cannot avail this scheme.`,
-                  type: "excluded_scheme_conflict",
-                  conflictingSchemes: excludedSchemeNames.map(s => ({
-                    _id: s._id,
-                    scheme_name: s.scheme_name,
-                  })),
-                });
-                continue; // Skip this row
-              }
+          if (scheme.excluded_schemes && scheme.excluded_schemes.length > 0 && ownerIds.length > 0) {
+            const excludedCheck = await hasAppliedToExcludedSchemes(ownerIds, scheme.excluded_schemes);
+
+            if (excludedCheck.hasApplied) {
+              const excludedSchemeNames = await Scheme.find({
+                _id: { $in: excludedCheck.appliedSchemeIds },
+              }).select("scheme_name");
+
+              redundancies.push({
+                row: rowNumber,
+                aadhaarNumber: aadhaarNumber,
+                fullName: mapped.demographics.fullName,
+                error: `Scheme conflict: This user is already enrolled in incompatible scheme(s): ${excludedSchemeNames.map((s) => s.scheme_name).join(", ")}. Cannot avail this scheme.`,
+                type: "excluded_scheme_conflict",
+                conflictingSchemes: excludedSchemeNames.map((s) => ({
+                  _id: s._id,
+                  scheme_name: s.scheme_name,
+                })),
+              });
+              continue;
             }
           }
 
-          // If application already exists in database, flag as redundancy
           if (existingApplication) {
             redundancies.push({
               row: rowNumber,
@@ -494,14 +597,14 @@ router.post(
               type: "existing_application",
               existingApplicationId: existingApplication._id,
             });
-            continue; // Skip this row
+            continue;
           }
 
           mappedData.push({
             row: rowNumber,
             userData: mapped,
-            hasExistingUser: !!existingUser,
-            hasExistingApplication: false, // We already filtered these out
+            hasExistingUser: !!puByMobile,
+            hasExistingApplication: false,
           });
         }
       }
@@ -624,6 +727,7 @@ router.post(
         errors: [],
         redundancies: [],
         created_users: 0,
+        created_beneficiary_persons: 0,
         created_applications: 0,
         updated_users: 0,
       };
@@ -667,24 +771,36 @@ router.post(
           // Track this Aadhaar number
           aadhaarTracker.set(aadhaarNumber, { row: rowNumber, fullName: mapped.demographics.fullName });
 
-          // Find or create user
-          const { user, isNew } = await findOrCreateUser(mapped, mapped.address.street);
-          
-          if (isNew) {
+          const { publicUser, isNew: isNewPu } = await findOrCreatePublicUserByMobileForBulk(mapped);
+          if (isNewPu) {
             results.created_users++;
           } else {
             results.updated_users++;
           }
 
-          // Check if user has applied to excluded schemes (scheme conflict check)
-          if (scheme.excluded_schemes && scheme.excluded_schemes.length > 0) {
-            const excludedCheck = await hasAppliedToExcludedSchemes(
-              user._id,
-              scheme.excluded_schemes
-            );
+          const ensured = await ensureBeneficiaryPersonForBulk(publicUser, mapped);
+          if (ensured.error) {
+            results.redundancies.push({
+              row: rowNumber,
+              aadhaarNumber: aadhaarNumber,
+              fullName: mapped.demographics.fullName,
+              error: ensured.error,
+              type: "aadhaar_other_household",
+            });
+            results.skipped++;
+            continue;
+          }
+          const { person, isNewPerson } = ensured;
+          if (isNewPerson) {
+            results.created_beneficiary_persons++;
+          }
+
+          const ownerIds = await getBulkApplicationOwnerIds(publicUser, mapped);
+
+          if (scheme.excluded_schemes && scheme.excluded_schemes.length > 0 && ownerIds.length > 0) {
+            const excludedCheck = await hasAppliedToExcludedSchemes(ownerIds, scheme.excluded_schemes);
 
             if (excludedCheck.hasApplied) {
-              // Get scheme names for better error message
               const excludedSchemeNames = await Scheme.find({
                 _id: { $in: excludedCheck.appliedSchemeIds },
               }).select("scheme_name");
@@ -693,9 +809,9 @@ router.post(
                 row: rowNumber,
                 aadhaarNumber: aadhaarNumber,
                 fullName: mapped.demographics.fullName,
-                error: `Scheme conflict: This user is already enrolled in incompatible scheme(s): ${excludedSchemeNames.map(s => s.scheme_name).join(", ")}. Cannot avail this scheme.`,
+                error: `Scheme conflict: This user is already enrolled in incompatible scheme(s): ${excludedSchemeNames.map((s) => s.scheme_name).join(", ")}. Cannot avail this scheme.`,
                 type: "excluded_scheme_conflict",
-                conflictingSchemes: excludedSchemeNames.map(s => ({
+                conflictingSchemes: excludedSchemeNames.map((s) => ({
                   _id: s._id,
                   scheme_name: s.scheme_name,
                 })),
@@ -705,11 +821,13 @@ router.post(
             }
           }
 
-          // Check if application already exists in database (redundancy check)
-          const existingApplication = await Application.findOne({
-            user_id: user._id,
-            scheme_id: scheme_id,
-          });
+          const existingApplication =
+            ownerIds.length > 0
+              ? await Application.findOne({
+                  user_id: { $in: ownerIds },
+                  scheme_id: scheme_id,
+                })
+              : null;
 
           if (existingApplication) {
             results.redundancies.push({
@@ -727,7 +845,8 @@ router.post(
           // Create application
           // Bulk uploaded beneficiaries are already availing the scheme, so set status to "Approved" and verification level to 99 (Completed)
           await Application.create({
-            user_id: user._id,
+            user_id: person._id,
+            applicant_ref_model: "BeneficiaryPerson",
             scheme_id: scheme_id,
             status: "Approved",
             verification_level: 99, // Completed - these are existing beneficiaries

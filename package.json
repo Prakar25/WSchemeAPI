@@ -10,7 +10,8 @@
     "seed:departments": "node scripts/seedDepartments.js",
     "migrate:schemes": "node scripts/migrateSchemesToObjectIds.js",
     "insert:schemes": "node scripts/insertExistingSchemes.js",
-    "migrate:admin-passwords": "node scripts/migrateAdminPasswordsToBcrypt.js"
+    "migrate:admin-passwords": "node scripts/migrateAdminPasswordsToBcrypt.js",
+    "migrate:option-a-households": "node scripts/migrateOptionAHouseholds.js --dry-run"
   },
   "keywords": [
     "api",

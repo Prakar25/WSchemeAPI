@@ -3,7 +3,9 @@ const router = express.Router();
 const PublicUser = require("../models/PublicUser");
 const AdminUser = require("../models/AdminUser");
 const Application = require("../models/Application");
+const BeneficiaryPerson = require("../models/BeneficiaryPerson");
 const adminAuth = require("../middleware/adminAuth");
+const { populateApplicantWithHousehold } = require("../utils/populateApplicant");
 
 /**
  * Require CSCAdmin role to access CSC verification endpoints
@@ -59,12 +61,16 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
     // - application is at CSC bio-auth verification levels (5,9)
     // - application is not rejected
     // - and the underlying PublicUser is NOT yet bio-auth verified
+    const applicantVerification = (app) =>
+      app.user_id?.householdId?.status?.verificationStatus ??
+      app.user_id?.status?.verificationStatus;
+
     const isCscBioAuthRequired = (app) => {
       if (app.status === "Bioauthentication") return true;
       return (
         [5, 9].includes(app.verification_level) &&
         app.status !== "Rejected" &&
-        app.user_id?.status?.verificationStatus !== "verified"
+        applicantVerification(app) !== "verified"
       );
     };
 
@@ -78,7 +84,7 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
         app.status !== "Rejected" &&
         (app.status === "Approved" ||
           ![5, 9].includes(app.verification_level) ||
-          app.user_id?.status?.verificationStatus === "verified")
+          applicantVerification(app) === "verified")
       );
     };
     const cscPendingCondition = {
@@ -89,11 +95,13 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
 
     let query = {};
     let searchedUser = null;
+    let searchedPerson = null;
 
     // If aadhaar search is provided, fetch all applications for that user regardless of stage/status.
     if (aadhaarNumber) {
       searchedUser = await PublicUser.findOne({ aadhaarNumber }).select("_id aadhaarNumber demographics.fullName");
-      if (!searchedUser) {
+      searchedPerson = await BeneficiaryPerson.findOne({ aadhaarNumber }).select("_id aadhaarNumber demographics.fullName");
+      if (!searchedUser && !searchedPerson) {
         return res.status(200).json({
           status: "success",
           message: "No user found for provided aadhaarNumber",
@@ -118,7 +126,10 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
           count: 0,
         });
       }
-      query = { user_id: searchedUser._id };
+      const applicantIds = [];
+      if (searchedUser) applicantIds.push(searchedUser._id);
+      if (searchedPerson) applicantIds.push(searchedPerson._id);
+      query = { user_id: { $in: applicantIds } };
     } else {
       // Without Aadhaar: default queue = CSC pending + approved.
       // status query overrides includeApproved/default behavior.
@@ -149,8 +160,9 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
     const [applications, total] = await Promise.all([
       Application.find(query)
         .populate(
-          "user_id",
-          "aadhaarNumber demographics.fullName demographics.gender contact.mobile.value contact.email.value status.verificationStatus"
+          populateApplicantWithHousehold(
+            "aadhaarNumber demographics.fullName demographics.gender contact.mobile.value contact.email.value status.verificationStatus householdId"
+          )
         )
         .populate("scheme_id", "scheme_name department category")
         .sort({ date_applied: -1 })
@@ -166,7 +178,10 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
         _id: app._id,
         applicantName: app.user_id?.demographics?.fullName || "Unknown",
         applicantAadhaarNumber: app.user_id?.aadhaarNumber || null,
-        applicantMobile: app.user_id?.contact?.mobile?.value || null,
+        applicantMobile:
+          app.user_id?.contact?.mobile?.value ||
+          app.user_id?.householdId?.contact?.mobile?.value ||
+          null,
         schemeName: app.scheme_id?.scheme_name || "Unknown",
         schemeId: app.scheme_id?._id || null,
         date_applied: app.date_applied,
@@ -184,13 +199,21 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
 
     return res.status(200).json({
       status: "success",
-      ...(searchedUser
+      ...(searchedUser || searchedPerson
         ? {
-            searchedUser: {
-              _id: searchedUser._id,
-              aadhaarNumber: searchedUser.aadhaarNumber || aadhaarNumber,
-              fullName: searchedUser.demographics?.fullName || null,
-            },
+            searchedUser: searchedUser
+              ? {
+                  _id: searchedUser._id,
+                  aadhaarNumber: searchedUser.aadhaarNumber || aadhaarNumber,
+                  fullName: searchedUser.demographics?.fullName || null,
+                  source: "PublicUser",
+                }
+              : {
+                  _id: searchedPerson._id,
+                  aadhaarNumber: searchedPerson.aadhaarNumber || aadhaarNumber,
+                  fullName: searchedPerson.demographics?.fullName || null,
+                  source: "BeneficiaryPerson",
+                },
           }
         : {}),
       pagination: {

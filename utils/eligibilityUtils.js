@@ -1,5 +1,46 @@
 const Application = require("../models/Application");
 
+/**
+ * Normalize stored gender to a canonical bucket for eligibility.
+ * DB/API values vary ("M", "Male", "male", "FEMALE", etc.); map consistently.
+ * @returns {"male"|"female"|"other"|null} null = missing or unrecognized
+ */
+function normalizePersonGender(value) {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim().toLowerCase().replace(/^\uFEFF/, "");
+  if (!s) return null;
+  if (s === "m" || s === "male" || s === "man") return "male";
+  if (s === "f" || s === "female" || s === "woman" || s === "women") return "female";
+  if (s === "o" || s === "other" || s === "others" || s === "transgender" || s === "trans") return "other";
+  return null;
+}
+
+/**
+ * How the scheme restricts applicants by gender (root `gender` or nested `scheme_eligibility.gender`).
+ * @returns {"all"|"male"|"female"} — unknown strings default to "all" so legacy data is not bricked; prefer explicit values in admin.
+ */
+function normalizeSchemeGenderFilter(scheme) {
+  const raw =
+    scheme?.gender != null && String(scheme.gender).trim() !== ""
+      ? String(scheme.gender).trim()
+      : scheme?.scheme_eligibility?.gender != null
+        ? String(scheme.scheme_eligibility.gender).trim()
+        : "";
+  if (!raw) return "all";
+  const s = raw.toLowerCase().replace(/^\uFEFF/, "");
+  if (s === "all" || s === "any" || s === "both" || s === "everyone") return "all";
+  if (s === "m" || s === "male" || s === "man" || s === "men") return "male";
+  if (s === "f" || s === "female" || s === "woman" || s === "women") return "female";
+  // Word-boundary heuristics so "women" is not matched by /\bmen\b/, etc.
+  if (/\b(women|woman|female|girls?|ladies)\b/i.test(raw) || /kanya|mahila/i.test(raw)) {
+    return "female";
+  }
+  if (/\b(men|male|boys?)\b/i.test(raw) || /\bpurush\b/i.test(raw)) {
+    return "male";
+  }
+  return "all";
+}
+
 // Helper function to calculate age from date of birth
 function calculateAge(dob) {
   if (!dob) return null;
@@ -14,14 +55,18 @@ function calculateAge(dob) {
 }
 
 // Helper function to check if user has applied to excluded schemes
-async function hasAppliedToExcludedSchemes(userId, excludedSchemeIds) {
-  if (!excludedSchemeIds || excludedSchemeIds.length === 0 || !userId) {
+async function hasAppliedToExcludedSchemes(userIdOrIds, excludedSchemeIds) {
+  const raw =
+    userIdOrIds == null ? [] : Array.isArray(userIdOrIds) ? userIdOrIds : [userIdOrIds];
+  const ids = raw.filter(Boolean).map((id) => (id && id.toString ? id.toString() : String(id)));
+  const uniqueIds = [...new Set(ids)];
+  if (!excludedSchemeIds || excludedSchemeIds.length === 0 || uniqueIds.length === 0) {
     return { hasApplied: false, appliedSchemeIds: [] };
   }
 
-  // Check if user has any applications for the excluded schemes
+  // Check if any linked applicant id has applications for the excluded schemes
   const applications = await Application.find({
-    user_id: userId,
+    user_id: { $in: uniqueIds },
     scheme_id: { $in: excludedSchemeIds },
     status: { $in: ["Applied", "Under Review", "Approved", "Pending", "Bioauthentication"] }, // Any active status
   }).select("scheme_id");
@@ -53,12 +98,19 @@ async function checkEligibility(user, scheme, userId = null) {
     return { eligible: false, reason: "Age requirement not met" };
   }
 
-  // Check gender eligibility
-  const userGender = user.demographics?.gender === "M" ? "Male" : 
-                     user.demographics?.gender === "F" ? "Female" : "Other";
-  const schemeGender = scheme.gender?.toLowerCase();
-  if (schemeGender && schemeGender !== "all" && schemeGender !== userGender.toLowerCase()) {
-    return { eligible: false, reason: "Gender requirement not met" };
+  // Check gender eligibility (normalized — was brittle on "Male"/"male" vs "M" and on missing scheme.gender)
+  const schemeGender = normalizeSchemeGenderFilter(scheme);
+  const applicantGender = normalizePersonGender(user.demographics?.gender);
+  if (schemeGender !== "all") {
+    if (!applicantGender) {
+      return {
+        eligible: false,
+        reason: "Gender information not available — update your profile before applying.",
+      };
+    }
+    if (applicantGender !== schemeGender) {
+      return { eligible: false, reason: "Gender requirement not met" };
+    }
   }
 
   // Check income eligibility if specified
@@ -82,7 +134,8 @@ async function checkEligibility(user, scheme, userId = null) {
 
   // Check excluded schemes - if user has applied to any excluded scheme, they're ineligible
   if (scheme.excluded_schemes && scheme.excluded_schemes.length > 0 && userId) {
-    const excludedCheck = await hasAppliedToExcludedSchemes(userId, scheme.excluded_schemes);
+    const exclusionIds = Array.isArray(userId) ? userId : [userId];
+    const excludedCheck = await hasAppliedToExcludedSchemes(exclusionIds, scheme.excluded_schemes);
     if (excludedCheck.hasApplied) {
       return { 
         eligible: false, 
@@ -98,5 +151,7 @@ module.exports = {
   calculateAge,
   hasAppliedToExcludedSchemes,
   checkEligibility,
+  normalizePersonGender,
+  normalizeSchemeGenderFilter,
 };
 

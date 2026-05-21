@@ -4,8 +4,14 @@ const applicationSchema = new mongoose.Schema(
   {
     user_id: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "PublicUser",
-      required: [true, "User ID is required"],
+      required: [true, "Applicant ID is required"],
+      refPath: "applicant_ref_model",
+    },
+    /** PublicUser (legacy) or BeneficiaryPerson (household member). */
+    applicant_ref_model: {
+      type: String,
+      enum: ["PublicUser", "BeneficiaryPerson"],
+      default: "PublicUser",
     },
     scheme_id: {
       type: mongoose.Schema.Types.ObjectId,

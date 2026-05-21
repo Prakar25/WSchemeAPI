@@ -1,12 +1,192 @@
 const express = require("express");
 const router = express.Router();
 const PublicUser = require("../models/PublicUser");
+const BeneficiaryPerson = require("../models/BeneficiaryPerson");
+const Household = require("../models/Household");
 const publicUserAuth = require("../middleware/publicUserAuth");
-const { getAccountStatusMessage } = require("../utils/publicUserMessages");
+const {
+  syncHouseholdFromPublicUser,
+  syncPrimaryBeneficiaryFromPublicUser,
+  addHouseholdFamilyMember,
+  listHouseholdMembers,
+  updateHouseholdMemberById,
+  md5Hex,
+} = require("../utils/householdService");
+const {
+  DOCUMENT_TYPES,
+  applyBeneficiaryProfileFromBody,
+  applyBeneficiaryDocumentsFromFiles,
+  buildBeneficiaryApiUserPayload,
+  loadActingBeneficiaryForRequest,
+} = require("../utils/beneficiaryProfileService");
+
+function publicUploadAbsPath(relativePath) {
+  return path.join(__dirname, "..", "public", relativePath);
+}
+const { getCscVerificationMessage } = require("../utils/publicUserMessages");
+const { buildKycFields } = require("../utils/kycStatus");
+const { computeBeneficiaryKycLevel } = require("../utils/householdService");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+
+function buildPrimaryAccountUserPayload(user) {
+  const kycLevel = computeBeneficiaryKycLevel(user);
+  user.kycLevel = kycLevel;
+  const cscVerificationStatus = user.status?.verificationStatus || "pending";
+  return {
+    _id: user._id,
+    userId: user._id,
+    beneficiaryPersonId: null,
+    publicUserId: user._id,
+    householdId: user.householdId || null,
+    isPrimary: true,
+    fullName: user.demographics?.fullName || null,
+    contactEmail: user.contact?.email?.value || null,
+    phoneNumber: user.contact?.mobile?.value || null,
+    address: user.address || null,
+    dob: user.demographics?.dob?.date || null,
+    aadhaarNumber: user.aadhaarNumber || null,
+    gender: user.demographics?.gender || null,
+    familyDetails: user.familyDetails || [],
+    documents: user.documents || null,
+    ...buildKycFields(kycLevel, user),
+    cscVerificationStatus,
+    verificationStatus: cscVerificationStatus,
+    accountStatusMessage: getCscVerificationMessage(cscVerificationStatus),
+  };
+}
+
+function serializeHouseholdMember(p) {
+  const kycLevel = computeBeneficiaryKycLevel(p);
+  return {
+    _id: p._id,
+    householdId: p.householdId,
+    isPrimary: p.isPrimary,
+    relationToPrimary: p.relationToPrimary,
+    aadhaarNumber: p.aadhaarNumber,
+    demographics: p.demographics,
+    address: p.address,
+    contact: p.contact,
+    ...buildKycFields(kycLevel, p),
+  };
+}
+
+function rejectNonAccountHolderBeneficiary(beneficiaryPerson, res) {
+  if (beneficiaryPerson && !beneficiaryPerson.isPrimary) {
+    res.status(403).json({
+      status: "error",
+      message: "Only the account holder can manage household members.",
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * GET /api/public-profile/household-members
+ * List all BeneficiaryPerson records for the logged-in household (primary first).
+ * Auth: same as other public-profile routes. Account holder only.
+ */
+router.get("/household-members", publicUserAuth, async (req, res) => {
+  try {
+    if (rejectNonAccountHolderBeneficiary(req.beneficiaryPerson, res)) return;
+
+    const result = await listHouseholdMembers(req.publicUser);
+    const members = (result.members || []).map(serializeHouseholdMember);
+
+    return res.status(200).json({
+      status: "success",
+      members,
+    });
+  } catch (error) {
+    console.error("List household members error:", error);
+    return res.status(500).json({ status: "error", message: "Internal server error" });
+  }
+});
+
+/**
+ * PUT /api/public-profile/household-members/:memberId
+ * Update a non-primary household member by Mongo _id.
+ * Body: same optional fields as PATCH-style update — fullName, gender, dob, relationToPrimary, email,
+ * address fields (careOf, house, street, locality, district, state, pincode, country), and optionally aadhaarNumber.
+ * Primary member cannot be updated here (use PUT /api/public-profile/update).
+ */
+router.put("/household-members/:memberId", publicUserAuth, async (req, res) => {
+  try {
+    if (rejectNonAccountHolderBeneficiary(req.beneficiaryPerson, res)) return;
+
+    const result = await updateHouseholdMemberById(
+      req.publicUser,
+      req.params.memberId,
+      req.body || {}
+    );
+    if (!result.ok) {
+      return res.status(result.status).json({ status: "error", message: result.message });
+    }
+
+    return res.status(200).json({
+      status: "success",
+      message: "Household member updated.",
+      member: serializeHouseholdMember(result.person),
+    });
+  } catch (error) {
+    console.error("Update household member error:", error);
+    if (error.code === 11000) {
+      return res.status(400).json({
+        status: "error",
+        message: "This Aadhaar is already registered to another beneficiary profile.",
+      });
+    }
+    return res.status(500).json({ status: "error", message: "Internal server error" });
+  }
+});
+
+/**
+ * POST /api/public-profile/household-members
+ * Add a non-primary BeneficiaryPerson to the logged-in household, or update one if the same Aadhaar already exists in this household.
+ *
+ * Auth: publicUserAuth — `userId` (PublicUser _id) or `mobileNumber` in query and/or body.
+ * Only the OTP account holder may call this (not when acting as a non-primary beneficiary profile).
+ *
+ * JSON body:
+ * - aadhaarNumber (required, 12 digits)
+ * - fullName (required on create; optional on update — must remain set)
+ * - gender (required on create: M | F | O; optional on update)
+ * - relationToPrimary (optional, default "member", max 64 chars)
+ * - dob (optional, parseable date)
+ * - email (optional)
+ * - careOf, house, street, locality, district, state, pincode (6 digits), country (optional address fields)
+ */
+router.post("/household-members", publicUserAuth, async (req, res) => {
+  try {
+    if (rejectNonAccountHolderBeneficiary(req.beneficiaryPerson, res)) return;
+
+    const result = await addHouseholdFamilyMember(req.publicUser, req.body || {});
+    if (!result.ok) {
+      return res.status(result.status).json({ status: "error", message: result.message });
+    }
+
+    const member = serializeHouseholdMember(result.person);
+
+    return res.status(result.created ? 201 : 200).json({
+      status: "success",
+      message: result.created ? "Household member added." : "Household member updated.",
+      created: result.created,
+      member,
+    });
+  } catch (error) {
+    console.error("Add household member error:", error);
+    if (error.code === 11000) {
+      return res.status(400).json({
+        status: "error",
+        message: "This Aadhaar is already registered to another beneficiary profile.",
+      });
+    }
+    return res.status(500).json({ status: "error", message: "Internal server error" });
+  }
+});
 
 /**
  * PUT /api/public-profile/update
@@ -16,6 +196,7 @@ const crypto = require("crypto");
 router.put("/update", publicUserAuth, async (req, res) => {
   try {
     const user = req.publicUser;
+    const beneficiaryPerson = req.beneficiaryPerson || null;
     const {
       aadhaarNumber,
       fullName,
@@ -32,6 +213,66 @@ router.put("/update", publicUserAuth, async (req, res) => {
       country,
       familyDetails,
     } = req.body;
+
+    if (beneficiaryPerson) {
+      const bp = await BeneficiaryPerson.findById(beneficiaryPerson._id);
+      if (!bp) {
+        return res.status(404).json({ status: "error", message: "Beneficiary profile not found." });
+      }
+      if (String(bp.householdId) !== String(user.householdId)) {
+        return res.status(403).json({ status: "error", message: "Access denied for this profile." });
+      }
+
+      const applied = await applyBeneficiaryProfileFromBody(bp, req.body, user);
+      if (!applied.ok) {
+        return res.status(applied.status).json({ status: "error", message: applied.message });
+      }
+      await bp.save();
+
+      if (bp.isPrimary) {
+        user.demographics = user.demographics || {};
+        if (fullName !== undefined) user.demographics.fullName = fullName.trim();
+        if (dob !== undefined) {
+          user.demographics.dob = user.demographics.dob || {};
+          user.demographics.dob.date = new Date(dob);
+          user.demographics.dob.verified = false;
+        }
+        if (gender !== undefined) {
+          const upperGender = gender.toUpperCase();
+          if (["M", "F", "O"].includes(upperGender)) user.demographics.gender = upperGender;
+        }
+        if (aadhaarNumber !== undefined) {
+          const trimmed = aadhaarNumber.trim();
+          user.aadhaarNumber = trimmed;
+          user.aadhaarHash = crypto.createHash("md5").update(trimmed).digest("hex");
+        }
+        if (email !== undefined) {
+          user.contact.email.value = email.trim().toLowerCase();
+          user.contact.email.verified = false;
+        }
+        if (careOf !== undefined) user.address.careOf = careOf.trim();
+        if (house !== undefined) user.address.house = house.trim();
+        if (street !== undefined) user.address.street = street.trim();
+        if (locality !== undefined) user.address.locality = locality.trim();
+        if (district !== undefined) user.address.district = district.trim();
+        if (state !== undefined) user.address.state = state.trim();
+        if (pincode !== undefined) user.address.pincode = pincode.trim();
+        if (country !== undefined) user.address.country = country.trim() || "India";
+        user.kycLevel = bp.kycLevel;
+        user.audit.lastUpdated = new Date();
+        user.audit.updateCount = (user.audit.updateCount || 0) + 1;
+        await user.save();
+      }
+
+      await syncHouseholdFromPublicUser(user);
+      if (bp.isPrimary) await syncPrimaryBeneficiaryFromPublicUser(user);
+
+      return res.status(200).json({
+        status: "success",
+        message: "Profile updated successfully",
+        user: await buildBeneficiaryApiUserPayload(bp, user),
+      });
+    }
 
     // Update demographics
     if (fullName !== undefined) {
@@ -58,12 +299,11 @@ router.put("/update", publicUserAuth, async (req, res) => {
         });
       }
 
-      // Check if Aadhaar is already used by another user
+      const trimmed = aadhaarNumber.trim();
       const existingUser = await PublicUser.findOne({
-        aadhaarNumber: aadhaarNumber.trim(),
+        aadhaarNumber: trimmed,
         _id: { $ne: user._id },
       });
-
       if (existingUser) {
         return res.status(400).json({
           status: "error",
@@ -71,8 +311,28 @@ router.put("/update", publicUserAuth, async (req, res) => {
         });
       }
 
-      user.aadhaarNumber = aadhaarNumber.trim();
-      user.aadhaarHash = crypto.createHash("md5").update(aadhaarNumber.trim()).digest("hex");
+      const bpOther = await BeneficiaryPerson.findOne({
+        aadhaarNumber: trimmed,
+        ...(beneficiaryPerson ? { _id: { $ne: beneficiaryPerson._id } } : {}),
+      });
+      if (bpOther) {
+        const sameHousehold =
+          user.householdId && String(bpOther.householdId) === String(user.householdId);
+        const primary = sameHousehold
+          ? await BeneficiaryPerson.findOne({ householdId: user.householdId, isPrimary: true })
+          : null;
+        const allowedPrimarySync =
+          sameHousehold && primary && String(primary._id) === String(bpOther._id) && !beneficiaryPerson;
+        if (!allowedPrimarySync) {
+          return res.status(400).json({
+            status: "error",
+            message: "Aadhaar number is already registered to another beneficiary profile.",
+          });
+        }
+      }
+
+      user.aadhaarNumber = trimmed;
+      user.aadhaarHash = crypto.createHash("md5").update(trimmed).digest("hex");
     }
 
     // Update email
@@ -167,29 +427,13 @@ router.put("/update", publicUserAuth, async (req, res) => {
     // it stays as is (CSDAdmin will need to re-verify if needed)
 
     await user.save();
-
-    // Return updated user data
-    const responseUser = {
-      _id: user._id,
-      userId: user._id,
-      fullName: user.demographics?.fullName || null,
-      contactEmail: user.contact?.email?.value || null,
-      phoneNumber: user.contact?.mobile?.value || null,
-      address: user.address || null,
-      dob: user.demographics?.dob?.date || null,
-      aadhaarNumber: user.aadhaarNumber || null,
-      gender: user.demographics?.gender || null,
-      familyDetails: user.familyDetails || [],
-      kycLevel: user.kycLevel,
-      documents: user.documents || null,
-      verificationStatus: user.status?.verificationStatus || "pending",
-      accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
-    };
+    await syncHouseholdFromPublicUser(user);
+    await syncPrimaryBeneficiaryFromPublicUser(user);
 
     return res.status(200).json({
       status: "success",
       message: "Profile updated successfully",
-      user: responseUser,
+      user: buildPrimaryAccountUserPayload(user),
     });
   } catch (error) {
     console.error("Profile update error:", error);
@@ -212,7 +456,8 @@ router.put("/update", publicUserAuth, async (req, res) => {
 /**
  * POST /api/public-profile/submit-complete
  * Submit profile data + all documents in one request (one form submit).
- * User identity: query params { userId }, { mobileNumber }
+ * Session: publicUserId or mobileNumber in query; when completing a household member profile,
+ * also pass userId = that BeneficiaryPerson _id (same as profile switch / "Applying as").
  *
  * FormData:
  * - Profile: fullName, dob, gender, email, aadhaarNumber, careOf, house, street, locality, district, state, pincode, country
@@ -369,8 +614,49 @@ router.post(
     try {
       const user = req.publicUser;
       const body = req.body || {};
+      const files = req.files || {};
+      const unlinkOld = (rel) => {
+        const p = publicUploadAbsPath(rel);
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+        return true;
+      };
 
-      // Aadhaar uniqueness check if provided
+      const acting = await loadActingBeneficiaryForRequest(req, user);
+      if (acting && !acting.ok) {
+        return res.status(acting.status).json({ status: "error", message: acting.message });
+      }
+
+      if (acting?.person) {
+        const bp = acting.person;
+        const applied = await applyBeneficiaryProfileFromBody(bp, body, user);
+        if (!applied.ok) {
+          return res.status(applied.status).json({ status: "error", message: applied.message });
+        }
+        applyBeneficiaryDocumentsFromFiles(bp, files, unlinkOld, publicUploadAbsPath);
+        await bp.save();
+
+        if (bp.isPrimary) {
+          applyProfileUpdates(user, body);
+          for (const docType of DOCUMENT_TYPES) {
+            if (files[docType]?.[0] && bp.documents[docType]) {
+              user.documents[docType] = { ...bp.documents[docType] };
+            }
+          }
+          user.kycLevel = bp.kycLevel;
+          user.status.verificationStatus = user.status.verificationStatus || "pending";
+          user.audit.lastUpdated = new Date();
+          user.audit.updateCount = (user.audit.updateCount || 0) + 1;
+          await user.save();
+          await syncPrimaryBeneficiaryFromPublicUser(user);
+        }
+
+        return res.status(200).json({
+          status: "success",
+          message: "Profile and documents saved successfully",
+          user: await buildBeneficiaryApiUserPayload(bp, user),
+        });
+      }
+
       const aadhaarNumber = body.aadhaarNumber != null ? String(body.aadhaarNumber).trim() : "";
       if (aadhaarNumber && /^\d{12}$/.test(aadhaarNumber)) {
         const existing = await PublicUser.findOne({
@@ -387,18 +673,12 @@ router.post(
 
       applyProfileUpdates(user, body);
 
-      const files = req.files || {};
-      const documentTypes = ["aadhaarCard", "birthCertificate", "certificateOfIdentification"];
-
-      for (const docType of documentTypes) {
+      for (const docType of DOCUMENT_TYPES) {
         if (files[docType] && files[docType][0]) {
           const file = files[docType][0];
           const oldDoc = user.documents[docType];
           if (oldDoc?.filePath) {
-            const oldPath = path.join(__dirname, "..", "public", oldDoc.filePath);
-            if (fs.existsSync(oldPath)) {
-              fs.unlinkSync(oldPath);
-            }
+            unlinkOld(oldDoc.filePath);
           }
           const relativePath = `/public/uploads/public-user-documents/${file.filename}`;
           user.documents[docType] = {
@@ -415,29 +695,13 @@ router.post(
       user.audit.updateCount = (user.audit.updateCount || 0) + 1;
 
       await user.save();
+      await syncPrimaryBeneficiaryFromPublicUser(user);
 
-      const responseUser = {
-        _id: user._id,
-        userId: user._id,
-        fullName: user.demographics?.fullName || null,
-        contactEmail: user.contact?.email?.value || null,
-        phoneNumber: user.contact?.mobile?.value || null,
-        address: user.address || null,
-        dob: user.demographics?.dob?.date || null,
-        aadhaarNumber: user.aadhaarNumber || null,
-        gender: user.demographics?.gender || null,
-        familyDetails: user.familyDetails || [],
-        kycLevel: user.kycLevel,
-        documents: user.documents || null,
-        verificationStatus: user.status?.verificationStatus || "pending",
-        accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
-      };
-
-    return res.status(200).json({
-      status: "success",
-      message: "Profile and documents saved successfully",
-      user: responseUser,
-    });
+      return res.status(200).json({
+        status: "success",
+        message: "Profile and documents saved successfully",
+        user: buildPrimaryAccountUserPayload(user),
+      });
   } catch (error) {
     console.error("Submit complete error:", error);
       if (req.files) {
@@ -465,33 +729,28 @@ router.post(
 
 /**
  * GET /api/public-profile
- * Get current user profile
- * User identity: query params { userId }, optionally { mobileNumber }
+ * Session: `publicUserId` (PublicUser _id from login) OR `mobileNumber` in query and/or body, plus optional `userId` for acting as a household member.
+ * When userId is a BeneficiaryPerson, `user` in the JSON uses that id so the client "Applying as" header matches.
  */
 router.get("/", publicUserAuth, async (req, res) => {
   try {
     const user = req.publicUser;
+    const beneficiaryPerson = req.beneficiaryPerson;
 
-    const responseUser = {
-      _id: user._id,
-      userId: user._id,
-      fullName: user.demographics?.fullName || null,
-      contactEmail: user.contact?.email?.value || null,
-      phoneNumber: user.contact?.mobile?.value || null,
-      address: user.address || null,
-      dob: user.demographics?.dob?.date || null,
-      aadhaarNumber: user.aadhaarNumber || null,
-      gender: user.demographics?.gender || null,
-      familyDetails: user.familyDetails || [],
-      kycLevel: user.kycLevel,
-      documents: user.documents || null,
-      verificationStatus: user.status?.verificationStatus || "pending",
-      accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
-    };
+    if (beneficiaryPerson) {
+      const loaded = await loadActingBeneficiaryForRequest(req, user);
+      if (!loaded.ok) {
+        return res.status(loaded.status).json({ status: "error", message: loaded.message });
+      }
+      return res.status(200).json({
+        status: "success",
+        user: await buildBeneficiaryApiUserPayload(loaded.person, user),
+      });
+    }
 
     return res.status(200).json({
       status: "success",
-      user: responseUser,
+      user: buildPrimaryAccountUserPayload(user),
     });
   } catch (error) {
     console.error("Get profile error:", error);
@@ -580,66 +839,57 @@ router.post(
       const { documentType } = req.body;
       const user = req.publicUser;
 
-      // Validate document type
-      const validDocumentTypes = [
-        "aadhaarCard",
-        "birthCertificate",
-        "certificateOfIdentification",
-      ];
-      if (!documentType || !validDocumentTypes.includes(documentType)) {
-        // Delete uploaded file if document type is invalid
+      if (!documentType || !DOCUMENT_TYPES.includes(documentType)) {
         fs.unlinkSync(req.file.path);
         return res.status(400).json({
           status: "error",
-          message: `Invalid document type. Must be one of: ${validDocumentTypes.join(", ")}`,
+          message: `Invalid document type. Must be one of: ${DOCUMENT_TYPES.join(", ")}`,
         });
       }
 
-      // Delete old file if exists
-      const documentField = user.documents[documentType];
-      if (documentField?.filePath) {
-        const oldFilePath = path.join(
-          __dirname,
-          "..",
-          "public",
-          documentField.filePath
-        );
-        if (fs.existsSync(oldFilePath)) {
-          fs.unlinkSync(oldFilePath);
-        }
+      const acting = await loadActingBeneficiaryForRequest(req, user);
+      if (acting && !acting.ok) {
+        fs.unlinkSync(req.file.path);
+        return res.status(acting.status).json({ status: "error", message: acting.message });
       }
 
-      // Update document path
       const relativePath = `/public/uploads/public-user-documents/${req.file.filename}`;
-      user.documents[documentType] = {
+      const docPayload = {
         filePath: relativePath,
         uploadedAt: new Date(),
-        verified: false, // Admin will verify later
+        verified: false,
       };
 
-      // Update audit fields
+      if (acting?.person) {
+        const bp = acting.person;
+        const oldDoc = bp.documents?.[documentType];
+        if (oldDoc?.filePath) {
+          const oldFilePath = publicUploadAbsPath(oldDoc.filePath);
+          if (fs.existsSync(oldFilePath)) fs.unlinkSync(oldFilePath);
+        }
+        bp.documents[documentType] = docPayload;
+        bp.audit.lastUpdated = new Date();
+        bp.audit.updateCount = (bp.audit.updateCount || 0) + 1;
+        await bp.save();
+
+        return res.status(200).json({
+          status: "success",
+          message: "Document uploaded successfully",
+          document: { type: documentType, filePath: relativePath, uploadedAt: docPayload.uploadedAt },
+          user: await buildBeneficiaryApiUserPayload(bp, user),
+        });
+      }
+
+      const documentField = user.documents[documentType];
+      if (documentField?.filePath) {
+        const oldFilePath = publicUploadAbsPath(documentField.filePath);
+        if (fs.existsSync(oldFilePath)) fs.unlinkSync(oldFilePath);
+      }
+
+      user.documents[documentType] = docPayload;
       user.audit.lastUpdated = new Date();
       user.audit.updateCount = (user.audit.updateCount || 0) + 1;
-
       await user.save();
-
-      // Return updated user data with documents
-      const responseUser = {
-        _id: user._id,
-        userId: user._id,
-        fullName: user.demographics?.fullName || null,
-        contactEmail: user.contact?.email?.value || null,
-        phoneNumber: user.contact?.mobile?.value || null,
-        address: user.address || null,
-        dob: user.demographics?.dob?.date || null,
-        aadhaarNumber: user.aadhaarNumber || null,
-        gender: user.demographics?.gender || null,
-        familyDetails: user.familyDetails || [],
-        kycLevel: user.kycLevel,
-        verificationStatus: user.status?.verificationStatus || "pending",
-        accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
-        documents: user.documents || null,
-      };
 
       return res.status(200).json({
         status: "success",
@@ -649,7 +899,7 @@ router.post(
           filePath: relativePath,
           uploadedAt: user.documents[documentType].uploadedAt,
         },
-        user: responseUser, // Include updated user data
+        user: buildPrimaryAccountUserPayload(user),
       });
     } catch (error) {
       console.error("Document upload error:", error);
@@ -692,43 +942,66 @@ router.post(
     try {
     const user = req.publicUser;
     const files = req.files || {};
-    const uploadedDocuments = [];
     const errors = [];
 
-    // Process each document type
-    const documentTypes = [
-      "aadhaarCard",
-      "birthCertificate",
-      "certificateOfIdentification",
-    ];
+    const acting = await loadActingBeneficiaryForRequest(req, user);
+    if (acting && !acting.ok) {
+      return res.status(acting.status).json({ status: "error", message: acting.message });
+    }
 
-    for (const documentType of documentTypes) {
+    const unlinkOld = (rel) => {
+      const p = publicUploadAbsPath(rel);
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+      return true;
+    };
+
+    if (acting?.person) {
+      const bp = acting.person;
+      const uploadedDocuments = applyBeneficiaryDocumentsFromFiles(
+        bp,
+        files,
+        unlinkOld,
+        publicUploadAbsPath
+      );
+
+      if (uploadedDocuments.length === 0 && Object.keys(files).length === 0) {
+        return res.status(400).json({
+          status: "error",
+          message: "No files uploaded. Please select at least one document to upload.",
+        });
+      }
+
+      if (uploadedDocuments.length > 0) {
+        bp.audit.lastUpdated = new Date();
+        bp.audit.updateCount = (bp.audit.updateCount || 0) + 1;
+        await bp.save();
+      }
+
+      return res.status(200).json({
+        status: "success",
+        message: `${uploadedDocuments.length} document(s) uploaded successfully`,
+        uploadedDocuments,
+        errors: errors.length > 0 ? errors : undefined,
+        user: await buildBeneficiaryApiUserPayload(bp, user),
+      });
+    }
+
+    const uploadedDocuments = [];
+
+    for (const documentType of DOCUMENT_TYPES) {
       if (files[documentType] && files[documentType][0]) {
         const file = files[documentType][0];
-
         try {
-          // Delete old file if exists
           const documentField = user.documents[documentType];
           if (documentField?.filePath) {
-            const oldFilePath = path.join(
-              __dirname,
-              "..",
-              "public",
-              documentField.filePath
-            );
-            if (fs.existsSync(oldFilePath)) {
-              fs.unlinkSync(oldFilePath);
-            }
+            unlinkOld(documentField.filePath);
           }
-
-          // Update document path
           const relativePath = `/public/uploads/public-user-documents/${file.filename}`;
           user.documents[documentType] = {
             filePath: relativePath,
             uploadedAt: new Date(),
-            verified: false, // Admin will verify later
+            verified: false,
           };
-
           uploadedDocuments.push({
             type: documentType,
             filePath: relativePath,
@@ -736,10 +1009,7 @@ router.post(
           });
         } catch (error) {
           console.error(`Error processing ${documentType}:`, error);
-          // Delete file if error occurred
-          if (fs.existsSync(file.path)) {
-            fs.unlinkSync(file.path);
-          }
+          if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
           errors.push({
             type: documentType,
             error: error.message || "Failed to process document",
@@ -748,7 +1018,6 @@ router.post(
       }
     }
 
-    // If no files were uploaded
     if (uploadedDocuments.length === 0 && Object.keys(files).length === 0) {
       return res.status(400).json({
         status: "error",
@@ -756,37 +1025,18 @@ router.post(
       });
     }
 
-    // Update audit fields
     if (uploadedDocuments.length > 0) {
       user.audit.lastUpdated = new Date();
       user.audit.updateCount = (user.audit.updateCount || 0) + 1;
       await user.save();
     }
 
-    // Return updated user data with documents
-    const responseUser = {
-      _id: user._id,
-      userId: user._id,
-      fullName: user.demographics?.fullName || null,
-      contactEmail: user.contact?.email?.value || null,
-      phoneNumber: user.contact?.mobile?.value || null,
-      address: user.address || null,
-      dob: user.demographics?.dob?.date || null,
-      aadhaarNumber: user.aadhaarNumber || null,
-      gender: user.demographics?.gender || null,
-      familyDetails: user.familyDetails || [],
-      kycLevel: user.kycLevel,
-      verificationStatus: user.status?.verificationStatus || "pending",
-      accountStatusMessage: getAccountStatusMessage(user.status?.verificationStatus),
-      documents: user.documents || null,
-    };
-
     return res.status(200).json({
       status: "success",
       message: `${uploadedDocuments.length} document(s) uploaded successfully`,
-      uploadedDocuments: uploadedDocuments,
+      uploadedDocuments,
       errors: errors.length > 0 ? errors : undefined,
-      user: responseUser, // Include updated user data with documents
+      user: buildPrimaryAccountUserPayload(user),
     });
   } catch (error) {
     console.error("Batch document upload error:", error);
@@ -821,39 +1071,48 @@ router.delete("/delete-document", publicUserAuth, async (req, res) => {
     const { documentType } = req.body;
     const user = req.publicUser;
 
-    // Validate document type
-    const validDocumentTypes = [
-      "aadhaarCard",
-      "birthCertificate",
-      "certificateOfIdentification",
-    ];
-    if (!documentType || !validDocumentTypes.includes(documentType)) {
+    if (!documentType || !DOCUMENT_TYPES.includes(documentType)) {
       return res.status(400).json({
         status: "error",
-        message: `Invalid document type. Must be one of: ${validDocumentTypes.join(", ")}`,
+        message: `Invalid document type. Must be one of: ${DOCUMENT_TYPES.join(", ")}`,
       });
     }
 
-    // Delete file from server
-    const documentField = user.documents[documentType];
-    if (documentField?.filePath) {
-      const filePath = path.join(__dirname, "..", "public", documentField.filePath);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
+    const acting = await loadActingBeneficiaryForRequest(req, user);
+    if (acting && !acting.ok) {
+      return res.status(acting.status).json({ status: "error", message: acting.message });
     }
 
-    // Clear document field
-    user.documents[documentType] = {
-      filePath: null,
-      uploadedAt: null,
-      verified: false,
-    };
+    const clearDoc = { filePath: null, uploadedAt: null, verified: false };
 
-    // Update audit fields
+    if (acting?.person) {
+      const bp = acting.person;
+      const documentField = bp.documents?.[documentType];
+      if (documentField?.filePath) {
+        const filePath = publicUploadAbsPath(documentField.filePath);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      }
+      bp.documents[documentType] = clearDoc;
+      bp.audit.lastUpdated = new Date();
+      bp.audit.updateCount = (bp.audit.updateCount || 0) + 1;
+      await bp.save();
+
+      return res.status(200).json({
+        status: "success",
+        message: "Document deleted successfully",
+        user: await buildBeneficiaryApiUserPayload(bp, user),
+      });
+    }
+
+    const documentField = user.documents[documentType];
+    if (documentField?.filePath) {
+      const filePath = publicUploadAbsPath(documentField.filePath);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+
+    user.documents[documentType] = clearDoc;
     user.audit.lastUpdated = new Date();
     user.audit.updateCount = (user.audit.updateCount || 0) + 1;
-
     await user.save();
 
     return res.status(200).json({

@@ -85,9 +85,14 @@ function normalizeCustomFormFields(fields) {
   });
 }
 const Application = require("../models/Application");
-const PublicUser = require("../models/PublicUser");
 const AdminUser = require("../models/AdminUser");
 const { checkEligibility, hasAppliedToExcludedSchemes } = require("../utils/eligibilityUtils");
+const {
+  assertApplicantAllowedForSession,
+  toEligibilitySubject,
+  getApplicantIdsForExcludedSchemesCheck,
+} = require("../utils/applicantResolver");
+const { resolvePublicUserSessionFromRequest } = require("../utils/publicSessionAnchor");
 const adminAuth = require("../middleware/adminAuth");
 const requireRole = require("../middleware/requireRole");
 const path = require("path");
@@ -109,7 +114,8 @@ function parseAgeGroup(ageGroup) {
 // GET /api/schemes - Get all schemes
 // Optional query params: 
 //   - filter_type: "scheme" or "applicant" (default: "applicant" if user_id is provided, otherwise "scheme")
-//   - user_id: Filter based on excluded schemes (applicant filter - only works with filter_type="applicant")
+//   - user_id: applicant id (PublicUser or BeneficiaryPerson) when filter_type=applicant
+//   - publicUserId or mobileNumber: session anchor (required with user_id for applicant filter; aliases: accountId, sessionUserId)
 //   - approved_only: Only return approved schemes (scheme filter - only works with filter_type="scheme")
 //   - pending_approval: Return schemes pending approval AND approved schemes (scheme filter - only works with filter_type="scheme")
 //   - category_id: Filter by category (ObjectId string)
@@ -157,26 +163,34 @@ router.get("/", async (req, res) => {
     // Applicant filters (only apply if filter_type is "applicant")
     // Note: We return all schemes but add eligibility information for frontend to gray out ineligible ones
     if (filterType === "applicant" && user_id) {
-      const user = await PublicUser.findById(user_id);
-      if (user) {
+      const session = await resolvePublicUserSessionFromRequest(req);
+      if (!session.ok) {
+        return res.status(session.status).json({ error: session.message });
+      }
+      const sessionUser = session.publicUser;
+      const allowed = await assertApplicantAllowedForSession(sessionUser, user_id);
+      if (!allowed.ok) {
+        return res.status(allowed.status).json({ error: allowed.message });
+      }
+      const resolved = allowed.resolved;
+      const subject = toEligibilitySubject(resolved);
+      if (subject) {
+        const exclusionIds = getApplicantIdsForExcludedSchemesCheck(resolved);
         const schemesWithEligibility = [];
-        
+
         for (const scheme of schemes) {
-          // Check eligibility for this scheme
-          const eligibility = await checkEligibility(user, scheme, user_id);
-          
-          // Convert scheme to plain object to add eligibility field
+          const eligibility = await checkEligibility(subject, scheme, exclusionIds);
+
           const schemeObj = scheme.toObject ? scheme.toObject() : scheme;
-          
-          // Add eligibility information to each scheme
+
           schemeObj.isEligible = eligibility.eligible;
           if (!eligibility.eligible) {
             schemeObj.eligibilityReason = eligibility.reason || "Not eligible";
           }
-          
+
           schemesWithEligibility.push(schemeObj);
         }
-        
+
         schemes = schemesWithEligibility;
       }
     }

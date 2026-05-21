@@ -8,7 +8,18 @@ const { checkEligibility } = require("../utils/eligibilityUtils");
 const adminAuth = require("../middleware/adminAuth");
 const requireRole = require("../middleware/requireRole");
 const { requestOTP, verifyOTP } = require("../utils/otpService");
-
+const {
+  resolveApplicantById,
+  assertApplicantAllowedForSession,
+  toEligibilitySubject,
+  applicantRefModelForResolved,
+  getPublicUserAccountForApplication,
+  getApplicantIdsForExcludedSchemesCheck,
+} = require("../utils/applicantResolver");
+const Household = require("../models/Household");
+const { ensureHouseholdForPublicUser } = require("../utils/householdService");
+const { populateApplicant } = require("../utils/populateApplicant");
+const { resolvePublicUserSessionFromRequest } = require("../utils/publicSessionAnchor");
 /**
  * Validate form_data against scheme.custom_form_fields.
  * Returns { valid: boolean, sanitizedFormData: object, errors: [{ field, message }] }.
@@ -109,6 +120,26 @@ function validateFormData(formData, customFormFields) {
 }
 
 /**
+ * Public citizen list/detail: session via query `publicUserId` or `mobileNumber`; verify :user_id belongs to that account.
+ */
+async function assertPublicApplicantFromQuery(req, res, applicantIdFromParam) {
+  const session = await resolvePublicUserSessionFromRequest(req, {
+    fallbackApplicantId: applicantIdFromParam,
+  });
+  if (!session.ok) {
+    res.status(session.status).json({ status: "error", message: session.message });
+    return null;
+  }
+  const sessionUser = session.publicUser;
+  const allowed = await assertApplicantAllowedForSession(sessionUser, applicantIdFromParam);
+  if (!allowed.ok) {
+    res.status(allowed.status).json({ status: "error", message: allowed.message });
+    return null;
+  }
+  return { sessionUser, resolved: allowed.resolved };
+}
+
+/**
  * Map legacy workflow levels to sequential (1-4 for scheme auth, 1-5 for verification).
  * Used for authorization_levels: preserve 1,2,3,4; only map legacy 5,6,7,8,9.
  * - 1,2,3,4 -> unchanged (scheme authorization_levels)
@@ -128,7 +159,7 @@ function mapOldAuthorizationLevelToNew(level) {
 }
 
 // POST /api/applications/apply - Apply to a scheme
-// Universal rule: only public users with verificationStatus === "verified" can apply; others get 403
+// user_id may be PublicUser _id (legacy) or BeneficiaryPerson _id (household member).
 router.post("/apply", async (req, res) => {
   try {
     const { user_id, scheme_id, form_data, documents_submitted } = req.body;
@@ -140,17 +171,27 @@ router.post("/apply", async (req, res) => {
       });
     }
 
-    // Check if user exists
-    const user = await PublicUser.findById(user_id);
-    if (!user) {
-      return res.status(404).json({
-        status: "error",
-        message: "User not found",
-      });
+    const session = await resolvePublicUserSessionFromRequest(req);
+    if (!session.ok) {
+      return res.status(session.status).json({ status: "error", message: session.message });
+    }
+    const sessionUser = session.publicUser;
+
+    const allowed = await assertApplicantAllowedForSession(sessionUser, user_id);
+    if (!allowed.ok) {
+      return res.status(allowed.status).json({ status: "error", message: allowed.message });
+    }
+    const resolved = allowed.resolved;
+
+    let verificationStatus = "verified";
+    if (resolved.kind === "PublicUser") {
+      await ensureHouseholdForPublicUser(resolved.publicUser);
+      verificationStatus = resolved.publicUser.status?.verificationStatus || "verified";
+    } else {
+      const h = await Household.findById(resolved.person.householdId);
+      verificationStatus = h?.status?.verificationStatus || "verified";
     }
 
-    // Registration is OTP-based; CSC center verification is not required to apply.
-    const verificationStatus = user.status?.verificationStatus || "verified";
     if (verificationStatus === "rejected") {
       return res.status(403).json({
         status: "error",
@@ -183,7 +224,11 @@ router.post("/apply", async (req, res) => {
     }
 
     // Check eligibility
-    const eligibility = await checkEligibility(user, scheme, user_id);
+    const eligibility = await checkEligibility(
+      toEligibilitySubject(resolved),
+      scheme,
+      getApplicantIdsForExcludedSchemesCheck(resolved)
+    );
     if (!eligibility.eligible) {
       return res.status(400).json({
         status: "error",
@@ -221,6 +266,7 @@ router.post("/apply", async (req, res) => {
     
     const application = await Application.create({
       user_id,
+      applicant_ref_model: applicantRefModelForResolved(resolved),
       scheme_id,
       status: "Applied",
       verification_level: initialVerificationLevel,
@@ -232,7 +278,7 @@ router.post("/apply", async (req, res) => {
     });
 
     const populatedApplication = await Application.findById(application._id)
-      .populate("user_id", "demographics.fullName")
+      .populate(populateApplicant("demographics.fullName"))
       .populate({
         path: "scheme_id",
         select: "scheme_name scheme_type category department",
@@ -299,7 +345,7 @@ router.post("/bioauthentication/queue", adminAuth, async (req, res) => {
     const ApplicationModel = require("../models/Application");
 
     // Fetch applications + users
-    const applications = await Application.find({ _id: { $in: ids } }).populate("user_id", "status audit");
+    const applications = await Application.find({ _id: { $in: ids } }).populate(populateApplicant("status audit"));
 
     const results = {
       updated: [],
@@ -308,8 +354,8 @@ router.post("/bioauthentication/queue", adminAuth, async (req, res) => {
 
     // Process sequentially (safe for audit/history). Can be optimized to bulk later.
     for (const app of applications) {
-      const user = app.user_id;
-      if (!user || !user._id) {
+      const accountUser = await getPublicUserAccountForApplication(app);
+      if (!accountUser?._id) {
         results.skipped.push({ applicationId: app._id, reason: "missing_public_user" });
         continue;
       }
@@ -322,16 +368,27 @@ router.post("/bioauthentication/queue", adminAuth, async (req, res) => {
 
       const prevStage = app.verification_stage || ApplicationModel.getStageNameFromLevel(app.verification_level || 0);
 
-      // Reset PublicUser to pending so CSCAdmin can re-bio-auth
-      user.status.verificationStatus = "pending";
-      user.status.verifiedBy = null;
-      user.status.verifiedAt = null;
-      user.status.rejectionReason = null;
-      if (user.audit) {
-        user.audit.lastUpdated = new Date();
-        user.audit.updateCount = (user.audit.updateCount || 0) + 1;
+      // Reset OTP account (PublicUser) + Household verification to pending so CSCAdmin can re-bio-auth
+      accountUser.status.verificationStatus = "pending";
+      accountUser.status.verifiedBy = null;
+      accountUser.status.verifiedAt = null;
+      accountUser.status.rejectionReason = null;
+      if (accountUser.audit) {
+        accountUser.audit.lastUpdated = new Date();
+        accountUser.audit.updateCount = (accountUser.audit.updateCount || 0) + 1;
       }
-      await user.save();
+      await accountUser.save();
+      if (accountUser.householdId) {
+        const hh = await Household.findById(accountUser.householdId);
+        if (hh) {
+          hh.status.verificationStatus = "pending";
+          hh.status.verifiedBy = null;
+          hh.status.verifiedAt = null;
+          hh.status.rejectionReason = null;
+          hh.audit.lastUpdated = new Date();
+          await hh.save();
+        }
+      }
 
       // Reset application to CSC stage for application verification
       app.status = "Bioauthentication";
@@ -416,7 +473,7 @@ router.post("/bioauthentication/requeue", adminAuth, async (req, res) => {
     const ApplicationModel = require("../models/Application");
 
     // Fetch applications + users
-    const applications = await Application.find({ _id: { $in: ids } }).populate("user_id", "status audit");
+    const applications = await Application.find({ _id: { $in: ids } }).populate(populateApplicant("status audit"));
 
     const results = {
       updated: [],
@@ -424,8 +481,8 @@ router.post("/bioauthentication/requeue", adminAuth, async (req, res) => {
     };
 
     for (const app of applications) {
-      const user = app.user_id;
-      if (!user || !user._id) {
+      const accountUser = await getPublicUserAccountForApplication(app);
+      if (!accountUser?._id) {
         results.skipped.push({ applicationId: app._id, reason: "missing_public_user" });
         continue;
       }
@@ -454,17 +511,27 @@ router.post("/bioauthentication/requeue", adminAuth, async (req, res) => {
       const prevStage = app.verification_stage || ApplicationModel.getStageNameFromLevel(app.verification_level || 0);
       const prevStatus = app.status || null;
 
-      // Reset PublicUser to pending so CSCAdmin can re-bio-auth
-      user.status = user.status || {};
-      user.status.verificationStatus = "pending";
-      user.status.verifiedBy = null;
-      user.status.verifiedAt = null;
-      user.status.rejectionReason = null;
-      if (user.audit) {
-        user.audit.lastUpdated = new Date();
-        user.audit.updateCount = (user.audit.updateCount || 0) + 1;
+      accountUser.status = accountUser.status || {};
+      accountUser.status.verificationStatus = "pending";
+      accountUser.status.verifiedBy = null;
+      accountUser.status.verifiedAt = null;
+      accountUser.status.rejectionReason = null;
+      if (accountUser.audit) {
+        accountUser.audit.lastUpdated = new Date();
+        accountUser.audit.updateCount = (accountUser.audit.updateCount || 0) + 1;
       }
-      await user.save();
+      await accountUser.save();
+      if (accountUser.householdId) {
+        const hh = await Household.findById(accountUser.householdId);
+        if (hh) {
+          hh.status.verificationStatus = "pending";
+          hh.status.verifiedBy = null;
+          hh.status.verifiedAt = null;
+          hh.status.rejectionReason = null;
+          hh.audit.lastUpdated = new Date();
+          await hh.save();
+        }
+      }
 
       // Reset application to CSC stage for re-bioauthentication
       app.status = "Bioauthentication";
@@ -533,7 +600,7 @@ router.put(
       const admin = req.admin;
 
       const application = await Application.findById(id)
-        .populate("user_id", "demographics.fullName")
+        .populate(populateApplicant("demographics.fullName"))
         .populate("scheme_id", "scheme_name");
 
       if (!application) {
@@ -739,7 +806,7 @@ router.get("/", adminAuth, async (req, res) => {
 
     // Fetch applications
     const applications = await Application.find(query)
-      .populate("user_id", "demographics.fullName demographics.gender demographics.dob aadhaarNumber contact")
+      .populate(populateApplicant("demographics.fullName demographics.gender demographics.dob aadhaarNumber contact"))
       .populate({
         path: "scheme_id",
         select: "scheme_name scheme_type category department",
@@ -887,7 +954,7 @@ router.get("/scheme/:scheme_id", async (req, res) => {
     if (userIdConstraint) appQuery.user_id = userIdConstraint;
 
     const applications = await Application.find(appQuery)
-      .populate("user_id", "demographics.fullName demographics.gender demographics.dob aadhaarNumber contact address")
+      .populate(populateApplicant("demographics.fullName demographics.gender demographics.dob aadhaarNumber contact address"))
       .populate({
         path: "scheme_id",
         select: "scheme_name scheme_type category department scheme_description",
@@ -963,7 +1030,7 @@ router.get("/:id", adminAuth, async (req, res) => {
     const { id } = req.params;
 
     const application = await Application.findById(id)
-      .populate("user_id")
+      .populate(populateApplicant())
       .populate("scheme_id")
       .populate("current_verifier.verified_by", "fullName username role contactNumber")
       .populate("verification_history.verified_by", "fullName username role");
@@ -1277,7 +1344,7 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     }
 
     const application = await Application.findById(id)
-      .populate("user_id")
+      .populate(populateApplicant())
       .populate("scheme_id");
 
     if (!application) {
@@ -1629,7 +1696,7 @@ router.post("/:id/verify", adminAuth, async (req, res) => {
     await application.save();
 
     const updatedApplication = await Application.findById(id)
-      .populate("user_id", "demographics.fullName demographics.gender demographics.dob aadhaarNumber contact address")
+      .populate(populateApplicant("demographics.fullName demographics.gender demographics.dob aadhaarNumber contact address"))
       .populate("scheme_id", "scheme_name scheme_type category department scheme_description")
       .populate("verification_history.verified_by", "fullName username role");
     
@@ -1744,6 +1811,8 @@ router.get("/user/:user_id/summary", async (req, res) => {
   try {
     const { user_id } = req.params;
 
+    if (!(await assertPublicApplicantFromQuery(req, res, user_id))) return;
+
     const applications = await Application.find({ user_id })
       .populate({
         path: "scheme_id",
@@ -1844,6 +1913,8 @@ router.get("/user/:user_id", async (req, res) => {
     const { user_id } = req.params;
     const { status } = req.query; // Optional filter by status
 
+    if (!(await assertPublicApplicantFromQuery(req, res, user_id))) return;
+
     const query = { user_id };
     if (status) {
       query.status = status;
@@ -1911,6 +1982,8 @@ router.get("/user/:user_id", async (req, res) => {
 router.get("/user/:user_id/:application_id", async (req, res) => {
   try {
     const { user_id, application_id } = req.params;
+
+    if (!(await assertPublicApplicantFromQuery(req, res, user_id))) return;
 
     const application = await Application.findOne({
       _id: application_id,
@@ -2055,7 +2128,7 @@ router.put("/:applicationId/approve", adminAuth, async (req, res) => {
     const admin = req.admin;
 
     const application = await Application.findById(applicationId)
-      .populate("user_id")
+      .populate(populateApplicant())
       .populate("scheme_id");
 
     if (!application) {
@@ -2171,7 +2244,7 @@ router.put("/:applicationId/approve", adminAuth, async (req, res) => {
     await application.save();
 
     const updatedApplication = await Application.findById(applicationId)
-      .populate("user_id")
+      .populate(populateApplicant())
       .populate("scheme_id")
       .populate("current_verifier.verified_by", "fullName username role contactNumber")
       .populate("verification_history.verified_by", "fullName username role");
@@ -2216,7 +2289,7 @@ router.post("/:applicationId/forward", adminAuth, async (req, res) => {
     }
 
     const application = await Application.findById(applicationId)
-      .populate("user_id")
+      .populate(populateApplicant())
       .populate("scheme_id");
 
     if (!application) {
@@ -2333,7 +2406,7 @@ router.post("/:applicationId/forward", adminAuth, async (req, res) => {
     await application.save();
 
     const updatedApplication = await Application.findById(applicationId)
-      .populate("user_id", "demographics.fullName")
+      .populate(populateApplicant("demographics.fullName"))
       .populate("scheme_id", "scheme_name department")
       .populate("current_verifier.verified_by", "fullName username role department contactNumber")
       .populate("verification_history.verified_by", "fullName username role");
@@ -2371,7 +2444,7 @@ router.put("/:applicationId/reject", adminAuth, async (req, res) => {
     const admin = req.admin;
 
     const application = await Application.findById(applicationId)
-      .populate("user_id")
+      .populate(populateApplicant())
       .populate("scheme_id");
 
     if (!application) {
@@ -2441,7 +2514,7 @@ router.put("/:applicationId/reject", adminAuth, async (req, res) => {
     await application.save();
 
     const updatedApplication = await Application.findById(applicationId)
-      .populate("user_id")
+      .populate(populateApplicant())
       .populate("scheme_id")
       .populate("current_verifier.verified_by", "fullName username role contactNumber")
       .populate("verification_history.verified_by", "fullName username role");

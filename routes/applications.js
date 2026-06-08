@@ -20,6 +20,11 @@ const Household = require("../models/Household");
 const { ensureHouseholdForPublicUser } = require("../utils/householdService");
 const { populateApplicant } = require("../utils/populateApplicant");
 const { resolvePublicUserSessionFromRequest } = require("../utils/publicSessionAnchor");
+const {
+  buildSchemeDocumentRequirements,
+  getApplicantProfileDocuments,
+  resolveApplicationDocumentsSubmitted,
+} = require("../utils/documentTypeService");
 /**
  * Validate form_data against scheme.custom_form_fields.
  * Returns { valid: boolean, sanitizedFormData: object, errors: [{ field, message }] }.
@@ -158,6 +163,53 @@ function mapOldAuthorizationLevelToNew(level) {
   return n;
 }
 
+/**
+ * GET /api/applications/scheme/:scheme_id/document-requirements
+ * Returns required documents for a scheme with profile prefill status for the applicant.
+ * Query: publicUserId or mobileNumber (session), userId (applicant PublicUser or BeneficiaryPerson).
+ */
+router.get("/scheme/:scheme_id/document-requirements", async (req, res) => {
+  try {
+    const { scheme_id } = req.params;
+    const { user_id: userIdQuery } = req.query;
+
+    if (!userIdQuery) {
+      return res.status(400).json({
+        status: "error",
+        message: "userId query param is required (applicant PublicUser or BeneficiaryPerson _id).",
+      });
+    }
+
+    const session = await resolvePublicUserSessionFromRequest(req);
+    if (!session.ok) {
+      return res.status(session.status).json({ status: "error", message: session.message });
+    }
+
+    const allowed = await assertApplicantAllowedForSession(session.publicUser, userIdQuery);
+    if (!allowed.ok) {
+      return res.status(allowed.status).json({ status: "error", message: allowed.message });
+    }
+
+    const scheme = await Scheme.findById(scheme_id);
+    if (!scheme) {
+      return res.status(404).json({ status: "error", message: "Scheme not found" });
+    }
+
+    const profileDocs = await getApplicantProfileDocuments(allowed.resolved);
+    const requirements = await buildSchemeDocumentRequirements(scheme, profileDocs);
+
+    return res.status(200).json({
+      status: "success",
+      scheme_id: scheme._id,
+      scheme_name: scheme.scheme_name,
+      ...requirements,
+    });
+  } catch (error) {
+    console.error("Document requirements error:", error);
+    return res.status(500).json({ status: "error", message: "Failed to load document requirements" });
+  }
+});
+
 // POST /api/applications/apply - Apply to a scheme
 // user_id may be PublicUser _id (legacy) or BeneficiaryPerson _id (household member).
 router.post("/apply", async (req, res) => {
@@ -251,6 +303,22 @@ router.post("/apply", async (req, res) => {
     // Use sanitized form_data (only keys from custom_form_fields; validated values)
     const sanitizedFormData = validation.sanitizedFormData;
 
+    const profileDocs = await getApplicantProfileDocuments(resolved);
+    const docResolve = await resolveApplicationDocumentsSubmitted(
+      scheme.scheme_required_document_types,
+      profileDocs,
+      documents_submitted
+    );
+    if (!docResolve.ok) {
+      return res.status(docResolve.status).json({
+        status: "error",
+        message: docResolve.message,
+        missing_document_keys: docResolve.missing_document_keys,
+        missing_document_labels: docResolve.missing_document_labels,
+        unknown_types: docResolve.unknown_types,
+      });
+    }
+
     // Get authorization levels from scheme (workflow sequence)
     const authorizationLevels = (scheme.authorization_levels || [])
       .map(mapOldAuthorizationLevelToNew)
@@ -274,7 +342,7 @@ router.post("/apply", async (req, res) => {
       authorization_levels: authorizationLevels, // Store the workflow sequence
       authorization_level_index: authorizationLevelIndex, // Start at first level
       form_data: sanitizedFormData,
-      documents_submitted: documents_submitted || [],
+      documents_submitted: docResolve.documents,
     });
 
     const populatedApplication = await Application.findById(application._id)
@@ -291,6 +359,7 @@ router.post("/apply", async (req, res) => {
     res.status(201).json({
       status: "success",
       message: "Application submitted successfully",
+      documents_prefilled_from_profile: docResolve.prefilled_from_profile || [],
       application: populatedApplication,
     });
   } catch (error) {

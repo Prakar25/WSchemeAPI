@@ -13,15 +13,47 @@ const {
   md5Hex,
 } = require("../utils/householdService");
 const {
-  DOCUMENT_TYPES,
   applyBeneficiaryProfileFromBody,
   applyBeneficiaryDocumentsFromFiles,
   buildBeneficiaryApiUserPayload,
   loadActingBeneficiaryForRequest,
 } = require("../utils/beneficiaryProfileService");
+const {
+  getProfileReusableKeys,
+  validateDocumentTypeKey,
+  documentsObjectToPlain,
+} = require("../utils/documentTypeService");
 
 function publicUploadAbsPath(relativePath) {
   return path.join(__dirname, "..", "public", relativePath);
+}
+
+function groupMulterFilesByFieldname(fileList) {
+  const map = {};
+  for (const f of fileList || []) {
+    if (!map[f.fieldname]) map[f.fieldname] = [];
+    map[f.fieldname].push(f);
+  }
+  return map;
+}
+
+async function validateProfileUploadDocumentType(documentType) {
+  const valid = await validateDocumentTypeKey(documentType);
+  if (!valid.ok) {
+    const keys = await getProfileReusableKeys();
+    return {
+      ok: false,
+      message: `Invalid document type. Profile uploads use keys: ${keys.join(", ")}`,
+    };
+  }
+  const reusable = await getProfileReusableKeys();
+  if (!reusable.includes(valid.key)) {
+    return {
+      ok: false,
+      message: `Document type "${valid.key}" is not configured for profile reuse. Upload it during scheme application instead.`,
+    };
+  }
+  return { ok: true, key: valid.key };
 }
 const { getCscVerificationMessage } = require("../utils/publicUserMessages");
 const { buildKycFields } = require("../utils/kycStatus");
@@ -50,7 +82,7 @@ function buildPrimaryAccountUserPayload(user) {
     aadhaarNumber: user.aadhaarNumber || null,
     gender: user.demographics?.gender || null,
     familyDetails: user.familyDetails || [],
-    documents: user.documents || null,
+    documents: documentsObjectToPlain(user.documents),
     ...buildKycFields(kycLevel, user),
     cscVerificationStatus,
     verificationStatus: cscVerificationStatus,
@@ -605,16 +637,12 @@ function computeKycLevel(user) {
 router.post(
   "/submit-complete",
   publicUserAuth,
-  uploadSubmitComplete.fields([
-    { name: "aadhaarCard", maxCount: 1 },
-    { name: "birthCertificate", maxCount: 1 },
-    { name: "certificateOfIdentification", maxCount: 1 },
-  ]),
+  uploadSubmitComplete.any(),
   async (req, res) => {
     try {
       const user = req.publicUser;
       const body = req.body || {};
-      const files = req.files || {};
+      const files = groupMulterFilesByFieldname(req.files);
       const unlinkOld = (rel) => {
         const p = publicUploadAbsPath(rel);
         if (fs.existsSync(p)) fs.unlinkSync(p);
@@ -632,12 +660,13 @@ router.post(
         if (!applied.ok) {
           return res.status(applied.status).json({ status: "error", message: applied.message });
         }
-        applyBeneficiaryDocumentsFromFiles(bp, files, unlinkOld, publicUploadAbsPath);
+        await applyBeneficiaryDocumentsFromFiles(bp, files, unlinkOld, publicUploadAbsPath);
         await bp.save();
 
         if (bp.isPrimary) {
           applyProfileUpdates(user, body);
-          for (const docType of DOCUMENT_TYPES) {
+          const profileKeys = await getProfileReusableKeys();
+          for (const docType of profileKeys) {
             if (files[docType]?.[0] && bp.documents[docType]) {
               user.documents[docType] = { ...bp.documents[docType] };
             }
@@ -673,7 +702,8 @@ router.post(
 
       applyProfileUpdates(user, body);
 
-      for (const docType of DOCUMENT_TYPES) {
+      const profileKeys = await getProfileReusableKeys();
+      for (const docType of profileKeys) {
         if (files[docType] && files[docType][0]) {
           const file = files[docType][0];
           const oldDoc = user.documents[docType];
@@ -839,12 +869,10 @@ router.post(
       const { documentType } = req.body;
       const user = req.publicUser;
 
-      if (!documentType || !DOCUMENT_TYPES.includes(documentType)) {
+      const typeCheck = await validateProfileUploadDocumentType(documentType);
+      if (!typeCheck.ok) {
         fs.unlinkSync(req.file.path);
-        return res.status(400).json({
-          status: "error",
-          message: `Invalid document type. Must be one of: ${DOCUMENT_TYPES.join(", ")}`,
-        });
+        return res.status(400).json({ status: "error", message: typeCheck.message });
       }
 
       const acting = await loadActingBeneficiaryForRequest(req, user);
@@ -933,15 +961,11 @@ router.post(
 router.post(
   "/upload-documents-batch",
   publicUserAuth,
-  upload.fields([
-    { name: "aadhaarCard", maxCount: 1 },
-    { name: "birthCertificate", maxCount: 1 },
-    { name: "certificateOfIdentification", maxCount: 1 },
-  ]),
+  upload.any(),
   async (req, res) => {
     try {
     const user = req.publicUser;
-    const files = req.files || {};
+    const files = groupMulterFilesByFieldname(req.files);
     const errors = [];
 
     const acting = await loadActingBeneficiaryForRequest(req, user);
@@ -957,7 +981,7 @@ router.post(
 
     if (acting?.person) {
       const bp = acting.person;
-      const uploadedDocuments = applyBeneficiaryDocumentsFromFiles(
+      const uploadedDocuments = await applyBeneficiaryDocumentsFromFiles(
         bp,
         files,
         unlinkOld,
@@ -988,11 +1012,12 @@ router.post(
 
     const uploadedDocuments = [];
 
-    for (const documentType of DOCUMENT_TYPES) {
+    const profileKeys = await getProfileReusableKeys();
+    for (const documentType of profileKeys) {
       if (files[documentType] && files[documentType][0]) {
         const file = files[documentType][0];
         try {
-          const documentField = user.documents[documentType];
+          const documentField = user.documents?.[documentType];
           if (documentField?.filePath) {
             unlinkOld(documentField.filePath);
           }
@@ -1071,11 +1096,9 @@ router.delete("/delete-document", publicUserAuth, async (req, res) => {
     const { documentType } = req.body;
     const user = req.publicUser;
 
-    if (!documentType || !DOCUMENT_TYPES.includes(documentType)) {
-      return res.status(400).json({
-        status: "error",
-        message: `Invalid document type. Must be one of: ${DOCUMENT_TYPES.join(", ")}`,
-      });
+    const typeCheck = await validateProfileUploadDocumentType(documentType);
+    if (!typeCheck.ok) {
+      return res.status(400).json({ status: "error", message: typeCheck.message });
     }
 
     const acting = await loadActingBeneficiaryForRequest(req, user);

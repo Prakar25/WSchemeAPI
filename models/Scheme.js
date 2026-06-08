@@ -79,6 +79,7 @@ const schemeSchema = new mongoose.Schema(
         default: [],
       },
     },
+    /** Canonical document type keys from GET /api/document-types (e.g. aadhaarCard). Legacy labels are normalized on save. */
     scheme_required_document_types: {
       type: [String],
       required: [true, "Required document types is required"],

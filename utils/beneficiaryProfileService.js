@@ -6,15 +6,21 @@ const { getCscVerificationMessage } = require("./publicUserMessages");
 const { buildKycFields } = require("./kycStatus");
 
 const EMAIL_REGEX = /^\S+@\S+\.\S+$/;
-const DOCUMENT_TYPES = ["aadhaarCard", "birthCertificate", "certificateOfIdentification"];
+const {
+  getProfileReusableKeys,
+  validateDocumentTypeKey,
+  documentsObjectToPlain,
+} = require("./documentTypeService");
 
-function ensureBeneficiaryDocuments(bp) {
-  if (!bp.documents) {
-    bp.documents = {
-      aadhaarCard: { filePath: null, uploadedAt: null, verified: false },
-      birthCertificate: { filePath: null, uploadedAt: null, verified: false },
-      certificateOfIdentification: { filePath: null, uploadedAt: null, verified: false },
-    };
+async function ensureBeneficiaryDocuments(bp) {
+  if (!bp.documents || typeof bp.documents !== "object") {
+    bp.documents = {};
+  }
+  const keys = await getProfileReusableKeys();
+  for (const key of keys) {
+    if (!bp.documents[key]) {
+      bp.documents[key] = { filePath: null, uploadedAt: null, verified: false };
+    }
   }
 }
 
@@ -143,11 +149,14 @@ async function applyBeneficiaryProfileFromBody(bp, body, sessionPublicUser) {
 /**
  * Persist uploaded files onto bp.documents. files: multer map { aadhaarCard: [file], ... }.
  */
-function applyBeneficiaryDocumentsFromFiles(bp, files, unlinkFs, pathJoin) {
-  ensureBeneficiaryDocuments(bp);
+async function applyBeneficiaryDocumentsFromFiles(bp, files, unlinkFs, pathJoin) {
+  await ensureBeneficiaryDocuments(bp);
   const saved = [];
+  const docTypes = Object.keys(files || {});
 
-  for (const docType of DOCUMENT_TYPES) {
+  for (const docType of docTypes) {
+    const valid = await validateDocumentTypeKey(docType);
+    if (!valid.ok) continue;
     const arr = files?.[docType];
     if (!arr?.[0]) continue;
     const file = arr[0];
@@ -193,7 +202,7 @@ async function buildBeneficiaryApiUserPayload(bp, sessionPublicUser) {
     aadhaarNumber: bp.aadhaarNumber || null,
     gender: bp.demographics?.gender || null,
     familyDetails: bp.isPrimary ? sessionPublicUser.familyDetails || [] : [],
-    documents: bp.documents || null,
+    documents: documentsObjectToPlain(bp.documents),
     ...buildKycFields(bp.kycLevel, bp),
     cscVerificationStatus,
     verificationStatus: cscVerificationStatus,
@@ -210,13 +219,12 @@ async function loadActingBeneficiaryForRequest(req, sessionPublicUser) {
   if (String(bp.householdId) !== String(sessionPublicUser.householdId)) {
     return { ok: false, status: 403, message: "Access denied for this profile." };
   }
-  ensureBeneficiaryDocuments(bp);
+  await ensureBeneficiaryDocuments(bp);
   await refreshBeneficiaryKycLevel(bp, { persist: true });
   return { ok: true, person: bp };
 }
 
 module.exports = {
-  DOCUMENT_TYPES,
   ensureBeneficiaryDocuments,
   applyBeneficiaryProfileFromBody,
   applyBeneficiaryDocumentsFromFiles,

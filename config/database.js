@@ -22,6 +22,13 @@ const connectDB = async () => {
       console.error("Startup migration (applicant_ref_model) failed:", e.message);
     }
 
+    try {
+      const { ensureDocumentTypesSeeded } = require("../utils/documentTypeService");
+      await ensureDocumentTypesSeeded();
+    } catch (e) {
+      console.error("Document type seed failed:", e.message);
+    }
+
     // Handle connection events
     mongoose.connection.on('error', (err) => {
       console.error('MongoDB connection error:', err);

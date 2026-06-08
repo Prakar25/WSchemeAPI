@@ -10,6 +10,9 @@ router.get("/health", (req, res) => {
   });
 });
 
+// Document type catalog (schemes, profile, applications)
+router.use("/document-types", require("./documentTypes"));
+
 // Scheme routes
 router.use("/schemes", require("./schemes"));
 

@@ -1,6 +1,26 @@
 const express = require("express");
 const router = express.Router();
 const Scheme = require("../models/Scheme");
+const {
+  enrichSchemeForResponse,
+  normalizeSchemeRequiredDocumentKeys,
+} = require("../utils/documentTypeService");
+
+async function normalizeSchemePayloadDocumentTypes(payload) {
+  if (!payload || payload.scheme_required_document_types === undefined) return payload;
+  const { keys, unknown } = await normalizeSchemeRequiredDocumentKeys(
+    payload.scheme_required_document_types
+  );
+  if (unknown.length > 0) {
+    const err = new Error(
+      `Unknown document type(s): ${unknown.join(", ")}. Use keys from GET /api/document-types.`
+    );
+    err.code = "UNKNOWN_DOCUMENT_TYPE";
+    err.unknown = unknown;
+    throw err;
+  }
+  return { ...payload, scheme_required_document_types: keys };
+}
 
 // Derive field_key from title: "Scheme Name" -> "scheme_name"
 function titleToFieldKey(title) {
@@ -195,14 +215,15 @@ router.get("/", async (req, res) => {
       }
     }
 
-    // Normalize scheme image URLs for frontend
-    const normalizedSchemes = (schemes || []).map((scheme) => {
-      const obj = scheme?.toObject ? scheme.toObject() : scheme;
-      if (obj && obj.scheme_image_file_url) {
-        obj.scheme_image_file_url = normalizeSchemeImageUrl(obj.scheme_image_file_url);
-      }
-      return obj;
-    });
+    const normalizedSchemes = await Promise.all(
+      (schemes || []).map(async (scheme) => {
+        const obj = scheme?.toObject ? scheme.toObject() : scheme;
+        if (obj?.scheme_image_file_url) {
+          obj.scheme_image_file_url = normalizeSchemeImageUrl(obj.scheme_image_file_url);
+        }
+        return enrichSchemeForResponse(obj);
+      })
+    );
 
     res.status(200).json(normalizedSchemes);
   } catch (error) {
@@ -275,7 +296,7 @@ router.get("/:id", async (req, res) => {
       );
     }
 
-    res.status(200).json(schemeObj);
+    res.status(200).json(await enrichSchemeForResponse(schemeObj));
   } catch (error) {
     console.error("Error fetching scheme:", error);
     if (error.name === "CastError") {
@@ -306,10 +327,23 @@ router.post("/", async (req, res) => {
       );
     }
 
-    // Create new scheme
-    const scheme = await Scheme.create(schemeData);
+    let normalizedData;
+    try {
+      normalizedData = await normalizeSchemePayloadDocumentTypes(schemeData);
+    } catch (e) {
+      if (e.code === "UNKNOWN_DOCUMENT_TYPE") {
+        return res.status(422).json({
+          error: "Unknown document type",
+          message: e.message,
+          unknown_types: e.unknown,
+        });
+      }
+      throw e;
+    }
 
-    res.status(200).json(scheme);
+    const scheme = await Scheme.create(normalizedData);
+
+    res.status(200).json(await enrichSchemeForResponse(scheme));
   } catch (error) {
     console.error("Error creating scheme:", error);
     if (error.name === "ValidationError") {
@@ -358,19 +392,39 @@ router.post("/update", async (req, res) => {
         updateData.scheme_eligibility.custom_fields
       );
     }
+    let normalizedUpdate = updateData;
+    if (updateData.scheme_required_document_types !== undefined) {
+      try {
+        normalizedUpdate = await normalizeSchemePayloadDocumentTypes({
+          scheme_required_document_types: updateData.scheme_required_document_types,
+        });
+        updateData.scheme_required_document_types =
+          normalizedUpdate.scheme_required_document_types;
+      } catch (e) {
+        if (e.code === "UNKNOWN_DOCUMENT_TYPE") {
+          return res.status(422).json({
+            status: "error",
+            error: "Unknown document type",
+            message: e.message,
+            unknown_types: e.unknown,
+          });
+        }
+        throw e;
+      }
+    }
+
     Object.keys(updateData).forEach((key) => {
       if (updateData[key] !== undefined) {
         existingScheme[key] = updateData[key];
       }
     });
 
-    // Save the scheme (this will trigger pre-save hooks and validators)
     const scheme = await existingScheme.save();
 
     res.status(200).json({
       status: "success",
       message: "Scheme updated successfully",
-      scheme: scheme,
+      scheme: await enrichSchemeForResponse(scheme),
     });
   } catch (error) {
     console.error("Error updating scheme:", error);

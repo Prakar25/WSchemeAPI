@@ -22,6 +22,8 @@ const {
   getProfileReusableKeys,
   validateDocumentTypeKey,
   documentsObjectToPlain,
+  buildProfileDocumentSlots,
+  getApplicantProfileDocuments,
 } = require("../utils/documentTypeService");
 
 function publicUploadAbsPath(relativePath) {
@@ -788,6 +790,44 @@ router.get("/", publicUserAuth, async (req, res) => {
       status: "error",
       message: "Internal server error",
     });
+  }
+});
+
+/**
+ * GET /api/public-profile/documents
+ * Profile KYC document catalog merged with the acting applicant's upload status.
+ * Query: userId (optional — household member BeneficiaryPerson _id), publicUserId / mobileNumber (session).
+ */
+router.get("/documents", publicUserAuth, async (req, res) => {
+  try {
+    const user = req.publicUser;
+    const acting = await loadActingBeneficiaryForRequest(req, user);
+    if (acting && !acting.ok) {
+      return res.status(acting.status).json({ status: "error", message: acting.message });
+    }
+
+    let resolved;
+    if (acting?.person) {
+      resolved = { kind: "BeneficiaryPerson", person: acting.person, publicUser: null };
+    } else {
+      resolved = { kind: "PublicUser", publicUser: user, person: null };
+    }
+
+    const profileDocs = await getApplicantProfileDocuments(resolved);
+    const document_slots = await buildProfileDocumentSlots(profileDocs);
+    const uploaded_count = document_slots.filter((s) => s.uploaded).length;
+
+    return res.status(200).json({
+      status: "success",
+      applicant_id: req.userId,
+      document_slots,
+      uploaded_count,
+      total_profile_document_types: document_slots.length,
+      profile_complete: uploaded_count === document_slots.length && document_slots.length > 0,
+    });
+  } catch (error) {
+    console.error("Get profile documents error:", error);
+    return res.status(500).json({ status: "error", message: "Failed to load profile documents" });
   }
 });
 

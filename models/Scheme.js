@@ -79,16 +79,15 @@ const schemeSchema = new mongoose.Schema(
         default: [],
       },
     },
-    /** Canonical document type keys from GET /api/document-types (e.g. aadhaarCard). Legacy labels are normalized on save. */
+    /** Admin-typed document names required for this scheme (free text, stored exactly as entered). */
     scheme_required_document_types: {
       type: [String],
-      required: [true, "Required document types is required"],
-      validate: {
-        validator: function(v) {
-          return Array.isArray(v) && v.length > 0;
-        },
-        message: "Required document types must be a non-empty array"
-      }
+      default: [],
+    },
+    /** Profile-reusable catalog keys that prepopulate from applicant profile (e.g. aadhaarCard). From GET /api/document-types?profile_only=true */
+    scheme_profile_document_types: {
+      type: [String],
+      default: [],
     },
     scheme_required_documents: {
       type: [
@@ -250,6 +249,23 @@ const schemeSchema = new mongoose.Schema(
     },
   }
 );
+
+schemeSchema.pre("validate", function () {
+  const textCount = Array.isArray(this.scheme_required_document_types)
+    ? this.scheme_required_document_types.length
+    : 0;
+  const profileCount = Array.isArray(this.scheme_profile_document_types)
+    ? this.scheme_profile_document_types.length
+    : 0;
+  if (textCount + profileCount === 0) {
+    this.invalidate(
+      "scheme_required_document_types",
+      new Error(
+        "At least one required document is needed — add custom document names and/or select profile documents that prepopulate from the applicant profile."
+      )
+    );
+  }
+});
 
 // Pre-save hook to prevent self-exclusion
 schemeSchema.pre('save', async function() {

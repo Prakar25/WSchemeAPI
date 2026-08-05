@@ -19,9 +19,14 @@ router.get("/", async (req, res) => {
     if (profile_only) {
       types = types.filter((t) => t.profileReusable);
     }
+    const profileReusableTypes = types.filter((t) => t.profileReusable);
+    const schemeOnlyTypes = types.filter((t) => !t.profileReusable);
+
     return res.status(200).json({
       status: "success",
       document_types: types,
+      profile_reusable_types: profileReusableTypes,
+      scheme_only_types: schemeOnlyTypes,
       count: types.length,
     });
   } catch (error) {

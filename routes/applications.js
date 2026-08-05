@@ -1,5 +1,8 @@
 const express = require("express");
 const router = express.Router();
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
 const Application = require("../models/Application");
 const Scheme = require("../models/Scheme");
 const PublicUser = require("../models/PublicUser");
@@ -7,6 +10,7 @@ const AdminUser = require("../models/AdminUser");
 const { checkEligibility } = require("../utils/eligibilityUtils");
 const adminAuth = require("../middleware/adminAuth");
 const requireRole = require("../middleware/requireRole");
+const publicUserAuth = require("../middleware/publicUserAuth");
 const { requestOTP, verifyOTP } = require("../utils/otpService");
 const {
   resolveApplicantById,
@@ -24,7 +28,57 @@ const {
   buildSchemeDocumentRequirements,
   getApplicantProfileDocuments,
   resolveApplicationDocumentsSubmitted,
+  enrichSchemeForResponse,
+  summarizeDocumentRequirements,
+  buildApplicantSummaryForApplyForm,
+  getDocumentTypeConfig,
+  validateUploadedFileAgainstConfig,
 } = require("../utils/documentTypeService");
+
+function normalizeSchemeImageUrl(url) {
+  if (!url || typeof url !== "string") return url;
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+  let normalized = url;
+  if (normalized.startsWith("/")) normalized = normalized.slice(1);
+  if (normalized.startsWith("public/")) normalized = normalized.slice("public/".length);
+  return normalized;
+}
+
+const applicationDocumentStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const folderPath = path.join(__dirname, "..", "public", "uploads", "scheme-application-documents");
+    if (!fs.existsSync(folderPath)) {
+      fs.mkdirSync(folderPath, { recursive: true });
+    }
+    cb(null, folderPath);
+  },
+  filename: (req, file, cb) => {
+    const userId = req.userId || "unknown";
+    const documentType = req.body?.documentType || req.query?.documentType || "document";
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    const fileExtension = path.extname(file.originalname);
+    cb(null, `${userId}_${documentType}_${uniqueSuffix}${fileExtension}`);
+  },
+});
+
+const uploadApplicationDocument = multer({
+  storage: applicationDocumentStorage,
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = [
+      "image/jpeg",
+      "image/jpg",
+      "image/png",
+      "image/webp",
+      "application/pdf",
+    ];
+    if (allowedMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Invalid file type. Only JPEG, PNG, WebP images and PDF files are allowed."), false);
+    }
+  },
+});
 /**
  * Validate form_data against scheme.custom_form_fields.
  * Returns { valid: boolean, sanitizedFormData: object, errors: [{ field, message }] }.
@@ -124,6 +178,14 @@ function validateFormData(formData, customFormFields) {
   };
 }
 
+function applicantIdFromQuery(req) {
+  const q = req.query || {};
+  const id = q.userId ?? q.user_id;
+  if (!id) return null;
+  const s = String(id).trim();
+  return s || null;
+}
+
 /**
  * Public citizen list/detail: session via query `publicUserId` or `mobileNumber`; verify :user_id belongs to that account.
  */
@@ -171,7 +233,7 @@ function mapOldAuthorizationLevelToNew(level) {
 router.get("/scheme/:scheme_id/document-requirements", async (req, res) => {
   try {
     const { scheme_id } = req.params;
-    const { user_id: userIdQuery } = req.query;
+    const userIdQuery = applicantIdFromQuery(req);
 
     if (!userIdQuery) {
       return res.status(400).json({
@@ -180,7 +242,9 @@ router.get("/scheme/:scheme_id/document-requirements", async (req, res) => {
       });
     }
 
-    const session = await resolvePublicUserSessionFromRequest(req);
+    const session = await resolvePublicUserSessionFromRequest(req, {
+      fallbackApplicantId: userIdQuery,
+    });
     if (!session.ok) {
       return res.status(session.status).json({ status: "error", message: session.message });
     }
@@ -209,6 +273,240 @@ router.get("/scheme/:scheme_id/document-requirements", async (req, res) => {
     return res.status(500).json({ status: "error", message: "Failed to load document requirements" });
   }
 });
+
+/**
+ * GET /api/applications/scheme/:scheme_id/apply-form
+ * Single payload for the public scheme application screen: scheme, eligibility, custom fields, document prefill.
+ * Query: userId (required), publicUserId or mobileNumber (session).
+ */
+router.get("/scheme/:scheme_id/apply-form", async (req, res) => {
+  try {
+    const { scheme_id } = req.params;
+    const userIdQuery = applicantIdFromQuery(req);
+
+    if (!userIdQuery) {
+      return res.status(400).json({
+        status: "error",
+        message: "userId query param is required (applicant PublicUser or BeneficiaryPerson _id).",
+      });
+    }
+
+    const session = await resolvePublicUserSessionFromRequest(req, {
+      fallbackApplicantId: userIdQuery,
+    });
+    if (!session.ok) {
+      return res.status(session.status).json({ status: "error", message: session.message });
+    }
+
+    const allowed = await assertApplicantAllowedForSession(session.publicUser, userIdQuery);
+    if (!allowed.ok) {
+      return res.status(allowed.status).json({ status: "error", message: allowed.message });
+    }
+
+    const scheme = await Scheme.findById(scheme_id);
+    if (!scheme) {
+      return res.status(404).json({ status: "error", message: "Scheme not found" });
+    }
+
+    const resolved = allowed.resolved;
+    const profileDocs = await getApplicantProfileDocuments(resolved);
+    const documentRequirements = await buildSchemeDocumentRequirements(scheme, profileDocs);
+    const documentSummary = summarizeDocumentRequirements(documentRequirements);
+
+    const subject = toEligibilitySubject(resolved);
+    const exclusionIds = getApplicantIdsForExcludedSchemesCheck(resolved);
+    const eligibility = subject
+      ? await checkEligibility(subject, scheme, exclusionIds)
+      : { eligible: false, reason: "Applicant profile not found" };
+
+    const existingApplication = await Application.findOne({
+      user_id: userIdQuery,
+      scheme_id,
+    }).select("_id status createdAt");
+
+    const previewDocs = await resolveApplicationDocumentsSubmitted(scheme, profileDocs, []);
+
+    const schemeObj = scheme.toObject ? scheme.toObject() : { ...scheme };
+    if (schemeObj.scheme_image_file_url) {
+      schemeObj.scheme_image_file_url = normalizeSchemeImageUrl(schemeObj.scheme_image_file_url);
+    }
+    const enrichedScheme = await enrichSchemeForResponse(schemeObj);
+
+    return res.status(200).json({
+      status: "success",
+      scheme_id: scheme._id,
+      scheme_name: scheme.scheme_name,
+      scheme: {
+        _id: enrichedScheme._id,
+        scheme_name: enrichedScheme.scheme_name,
+        scheme_description: enrichedScheme.scheme_description,
+        scheme_objectives: enrichedScheme.scheme_objectives,
+        scheme_benefits: enrichedScheme.scheme_benefits,
+        scheme_eligibility: enrichedScheme.scheme_eligibility,
+        scheme_image_file_url: enrichedScheme.scheme_image_file_url,
+        custom_form_fields: enrichedScheme.custom_form_fields || [],
+        scheme_required_document_types: enrichedScheme.scheme_required_document_types || [],
+        scheme_profile_document_types: enrichedScheme.scheme_profile_document_types || [],
+        scheme_profile_documents_enriched: enrichedScheme.scheme_profile_documents_enriched || [],
+        scheme_text_documents_enriched: enrichedScheme.scheme_text_documents_enriched || [],
+        scheme_required_documents_enriched: enrichedScheme.scheme_required_documents_enriched || [],
+        all_required_document_keys: enrichedScheme.all_required_document_keys || [],
+        uses_legacy_document_format: enrichedScheme.uses_legacy_document_format,
+      },
+      applicant: buildApplicantSummaryForApplyForm(resolved, profileDocs),
+      isEligible: eligibility.eligible,
+      eligibilityReason: eligibility.eligible ? null : eligibility.reason || "Not eligible",
+      already_applied: !!existingApplication,
+      existing_application: existingApplication
+        ? {
+            _id: existingApplication._id,
+            status: existingApplication.status,
+            createdAt: existingApplication.createdAt,
+          }
+        : null,
+      custom_form_fields: scheme.custom_form_fields || [],
+      ...documentRequirements,
+      document_summary: documentSummary,
+      document_summary_text: documentSummary.summary_text,
+      documents_ready: documentSummary.all_documents_ready,
+      suggested_documents_submitted: previewDocs.ok ? previewDocs.documents : [],
+      documents_prefill_preview: previewDocs.ok ? previewDocs.prefilled_from_profile : [],
+      documents_missing_preview: previewDocs.ok ? [] : previewDocs.missing_document_keys || [],
+    });
+  } catch (error) {
+    console.error("Apply form error:", error);
+    return res.status(500).json({ status: "error", message: "Failed to load apply form" });
+  }
+});
+
+/**
+ * POST /api/applications/preview-documents
+ * Dry-run document merge (profile prefill + submitted uploads) before apply.
+ * Body: { user_id, scheme_id, documents_submitted? }
+ */
+router.post("/preview-documents", async (req, res) => {
+  try {
+    const { user_id, scheme_id, documents_submitted } = req.body || {};
+
+    if (!user_id || !scheme_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "user_id and scheme_id are required.",
+      });
+    }
+
+    const session = await resolvePublicUserSessionFromRequest(req);
+    if (!session.ok) {
+      return res.status(session.status).json({ status: "error", message: session.message });
+    }
+
+    const allowed = await assertApplicantAllowedForSession(session.publicUser, user_id);
+    if (!allowed.ok) {
+      return res.status(allowed.status).json({ status: "error", message: allowed.message });
+    }
+
+    const scheme = await Scheme.findById(scheme_id);
+    if (!scheme) {
+      return res.status(404).json({ status: "error", message: "Scheme not found" });
+    }
+
+    const profileDocs = await getApplicantProfileDocuments(allowed.resolved);
+    const docResolve = await resolveApplicationDocumentsSubmitted(
+      scheme,
+      profileDocs,
+      documents_submitted
+    );
+
+    if (!docResolve.ok) {
+      return res.status(docResolve.status).json({
+        status: "error",
+        message: docResolve.message,
+        missing_document_keys: docResolve.missing_document_keys,
+        missing_document_labels: docResolve.missing_document_labels,
+        unknown_types: docResolve.unknown_types,
+      });
+    }
+
+    return res.status(200).json({
+      status: "success",
+      documents_submitted: docResolve.documents,
+      documents_prefilled_from_profile: docResolve.prefilled_from_profile || [],
+      ready_to_apply: true,
+    });
+  } catch (error) {
+    console.error("Preview documents error:", error);
+    return res.status(500).json({ status: "error", message: "Failed to preview documents" });
+  }
+});
+
+/**
+ * POST /api/applications/upload-document
+ * Upload a document for scheme application (scheme-only or override of profile prefill).
+ * Query: documentType, userId (optional), publicUserId / mobileNumber (session).
+ * FormData: file
+ */
+router.post(
+  "/upload-document",
+  publicUserAuth,
+  uploadApplicationDocument.single("file"),
+  async (req, res) => {
+    try {
+      const documentType = req.body?.documentType || req.query?.documentType;
+      const schemeId = req.body?.scheme_id || req.query?.scheme_id;
+      if (!documentType) {
+        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        return res.status(400).json({
+          status: "error",
+          message: "documentType is required (query or form body).",
+        });
+      }
+
+      let scheme = null;
+      if (schemeId) {
+        scheme = await Scheme.findById(schemeId);
+        if (!scheme) {
+          if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+          return res.status(404).json({ status: "error", message: "Scheme not found" });
+        }
+      }
+
+      const typeConfig = await getDocumentTypeConfig(documentType, { scheme });
+      if (!typeConfig.ok) {
+        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        return res.status(400).json({ status: "error", message: typeConfig.message });
+      }
+
+      const fileCheck = validateUploadedFileAgainstConfig(req.file, typeConfig);
+      if (!fileCheck.ok) {
+        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        return res.status(400).json({ status: "error", message: fileCheck.message });
+      }
+
+      const relativePath = `/public/uploads/scheme-application-documents/${req.file.filename}`;
+
+      return res.status(200).json({
+        status: "success",
+        message: "Document uploaded successfully",
+        document: {
+          document_type: typeConfig.key,
+          label: typeConfig.label,
+          file_url: relativePath,
+          filePath: relativePath,
+          uploaded_at: new Date(),
+          source: "application",
+          profileReusable: typeConfig.profileReusable,
+          isCustom: !!typeConfig.isCustom,
+        },
+      });
+    } catch (error) {
+      console.error("Application document upload error:", error);
+      if (req.file?.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      return res.status(500).json({ status: "error", message: "Failed to upload document" });
+    }
+  }
+);
 
 // POST /api/applications/apply - Apply to a scheme
 // user_id may be PublicUser _id (legacy) or BeneficiaryPerson _id (household member).
@@ -305,7 +603,7 @@ router.post("/apply", async (req, res) => {
 
     const profileDocs = await getApplicantProfileDocuments(resolved);
     const docResolve = await resolveApplicationDocumentsSubmitted(
-      scheme.scheme_required_document_types,
+      scheme,
       profileDocs,
       documents_submitted
     );

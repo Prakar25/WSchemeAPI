@@ -3,24 +3,8 @@ const router = express.Router();
 const Scheme = require("../models/Scheme");
 const {
   enrichSchemeForResponse,
-  normalizeSchemeRequiredDocumentKeys,
+  normalizeSchemeDocumentsPayload,
 } = require("../utils/documentTypeService");
-
-async function normalizeSchemePayloadDocumentTypes(payload) {
-  if (!payload || payload.scheme_required_document_types === undefined) return payload;
-  const { keys, unknown } = await normalizeSchemeRequiredDocumentKeys(
-    payload.scheme_required_document_types
-  );
-  if (unknown.length > 0) {
-    const err = new Error(
-      `Unknown document type(s): ${unknown.join(", ")}. Use keys from GET /api/document-types.`
-    );
-    err.code = "UNKNOWN_DOCUMENT_TYPE";
-    err.unknown = unknown;
-    throw err;
-  }
-  return { ...payload, scheme_required_document_types: keys };
-}
 
 // Derive field_key from title: "Scheme Name" -> "scheme_name"
 function titleToFieldKey(title) {
@@ -329,13 +313,26 @@ router.post("/", async (req, res) => {
 
     let normalizedData;
     try {
-      normalizedData = await normalizeSchemePayloadDocumentTypes(schemeData);
+      normalizedData = await normalizeSchemeDocumentsPayload(schemeData);
     } catch (e) {
       if (e.code === "UNKNOWN_DOCUMENT_TYPE") {
         return res.status(422).json({
           error: "Unknown document type",
           message: e.message,
           unknown_types: e.unknown,
+        });
+      }
+      if (e.code === "NO_REQUIRED_DOCUMENTS") {
+        return res.status(422).json({
+          error: "No required documents",
+          message: e.message,
+        });
+      }
+      if (e.code === "INVALID_PROFILE_DOCUMENT_TYPE") {
+        return res.status(422).json({
+          error: "Invalid profile document type",
+          message: e.message,
+          invalid_types: e.invalid,
         });
       }
       throw e;
@@ -392,21 +389,32 @@ router.post("/update", async (req, res) => {
         updateData.scheme_eligibility.custom_fields
       );
     }
-    let normalizedUpdate = updateData;
-    if (updateData.scheme_required_document_types !== undefined) {
+    if (
+      updateData.scheme_required_document_types !== undefined ||
+      updateData.scheme_profile_document_types !== undefined
+    ) {
       try {
-        normalizedUpdate = await normalizeSchemePayloadDocumentTypes({
-          scheme_required_document_types: updateData.scheme_required_document_types,
-        });
-        updateData.scheme_required_document_types =
-          normalizedUpdate.scheme_required_document_types;
+        const normalizedUpdate = await normalizeSchemeDocumentsPayload(updateData, existingScheme);
+        if (updateData.scheme_required_document_types !== undefined) {
+          updateData.scheme_required_document_types = normalizedUpdate.scheme_required_document_types;
+        }
+        if (updateData.scheme_profile_document_types !== undefined) {
+          updateData.scheme_profile_document_types = normalizedUpdate.scheme_profile_document_types;
+        }
       } catch (e) {
-        if (e.code === "UNKNOWN_DOCUMENT_TYPE") {
+        if (e.code === "INVALID_PROFILE_DOCUMENT_TYPE") {
           return res.status(422).json({
             status: "error",
-            error: "Unknown document type",
+            error: "Invalid profile document type",
             message: e.message,
-            unknown_types: e.unknown,
+            invalid_types: e.invalid,
+          });
+        }
+        if (e.code === "NO_REQUIRED_DOCUMENTS") {
+          return res.status(422).json({
+            status: "error",
+            error: "No required documents",
+            message: e.message,
           });
         }
         throw e;

@@ -1,34 +1,41 @@
 /**
- * One-time: convert scheme_required_document_types labels to canonical keys.
+ * One-time: split legacy scheme_required_document_types into:
+ * - scheme_required_document_types (admin free text, non-profile)
+ * - scheme_profile_document_types (profile-reusable catalog keys)
+ *
  * Run: node scripts/normalizeSchemeDocumentKeys.js
  */
 require("dotenv").config();
 const mongoose = require("mongoose");
 const Scheme = require("../models/Scheme");
-const { normalizeSchemeRequiredDocumentKeys } = require("../utils/documentTypeService");
+const {
+  getSchemeRequiredTextLabels,
+  getSchemeProfileDocumentKeys,
+} = require("../utils/documentTypeService");
 
 async function main() {
   await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/wscheme");
   const schemes = await Scheme.find({});
   let updated = 0;
+
   for (const s of schemes) {
-    const { keys, unknown } = await normalizeSchemeRequiredDocumentKeys(
-      s.scheme_required_document_types || []
-    );
-    const before = JSON.stringify(s.scheme_required_document_types);
-    const after = JSON.stringify(keys);
-    if (keys.length === 0) {
-      console.warn(s.scheme_name, "skipped: no resolvable document types", unknown);
+    if (s.scheme_profile_document_types !== undefined) {
       continue;
     }
-    if (before !== after) {
-      s.scheme_required_document_types = keys;
-      await s.save();
-      updated++;
-      console.log(s.scheme_name, "->", keys, unknown.length ? `(unknown: ${unknown})` : "");
-    }
+
+    const textLabels = await getSchemeRequiredTextLabels(s);
+    const profileKeys = await getSchemeProfileDocumentKeys(s);
+
+    s.scheme_required_document_types = textLabels;
+    s.scheme_profile_document_types = profileKeys;
+    await s.save();
+    updated++;
+    console.log(s.scheme_name);
+    console.log("  text:", textLabels);
+    console.log("  profile:", profileKeys);
   }
-  console.log(`Done. Updated ${updated} scheme(s).`);
+
+  console.log(`Done. Migrated ${updated} scheme(s).`);
   process.exit(0);
 }
 

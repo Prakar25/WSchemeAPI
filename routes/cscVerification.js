@@ -32,8 +32,8 @@ const requireCscAdmin = (req, res, next) => {
  *  - includeApproved (optional boolean): only used when status is not provided
  *      true => include approved along with CSC pending
  *      false => only CSC pending
- *  - aadhaarNumber (optional, 12 digits): when provided, return ALL applications of that user
- *    and segregate into CSC-bio-auth required vs others.
+ *  - aadhaarNumber (optional): prefix search, spaces ignored (e.g. "6123" or "6123 4567 8901").
+ *      Min 4 digits, max 12. Returns applications for all matching users, segregated.
  *
  * Default behavior (without aadhaarNumber): returns CSC pending + approved.
  * Requires: admin auth, CSCAdmin role
@@ -44,12 +44,13 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
     const rawLimit = parseInt(String(req.query.limit || "20"), 10) || 20;
     const limit = Math.min(Math.max(rawLimit, 1), 100);
     const skip = (page - 1) * limit;
-    const aadhaarNumber = String(req.query.aadhaarNumber || "").trim();
+    // Allow spaced input like "6123 4567 8901" and prefix typing like "6123"
+    const aadhaarDigits = String(req.query.aadhaarNumber || "").replace(/\D/g, "");
 
-    if (aadhaarNumber && !/^\d{12}$/.test(aadhaarNumber)) {
+    if (aadhaarDigits && (aadhaarDigits.length < 4 || aadhaarDigits.length > 12)) {
       return res.status(400).json({
         status: "error",
-        message: "aadhaarNumber must be a 12-digit number",
+        message: "aadhaarNumber must be 4–12 digits (spaces ignored; prefix search supported)",
       });
     }
 
@@ -95,16 +96,37 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
 
     let query = {};
     let searchedUser = null;
-    let searchedPerson = null;
+    let matchedApplicants = [];
 
-    // If aadhaar search is provided, fetch all applications for that user regardless of stage/status.
-    if (aadhaarNumber) {
-      searchedUser = await PublicUser.findOne({ aadhaarNumber }).select("_id aadhaarNumber demographics.fullName");
-      searchedPerson = await BeneficiaryPerson.findOne({ aadhaarNumber }).select("_id aadhaarNumber demographics.fullName");
-      if (!searchedUser && !searchedPerson) {
+    // If aadhaar search is provided, prefix-match users and return their applications.
+    if (aadhaarDigits) {
+      const aadhaarPrefixRegex = new RegExp(`^${aadhaarDigits}`);
+      const [matchedUsers, matchedPersons] = await Promise.all([
+        PublicUser.find({ aadhaarNumber: aadhaarPrefixRegex }).select("_id aadhaarNumber demographics.fullName"),
+        BeneficiaryPerson.find({ aadhaarNumber: aadhaarPrefixRegex }).select("_id aadhaarNumber demographics.fullName"),
+      ]);
+
+      matchedApplicants = [
+        ...matchedUsers.map((u) => ({
+          _id: u._id,
+          aadhaarNumber: u.aadhaarNumber || null,
+          fullName: u.demographics?.fullName || null,
+          source: "PublicUser",
+        })),
+        ...matchedPersons.map((p) => ({
+          _id: p._id,
+          aadhaarNumber: p.aadhaarNumber || null,
+          fullName: p.demographics?.fullName || null,
+          source: "BeneficiaryPerson",
+        })),
+      ];
+
+      if (matchedApplicants.length === 0) {
         return res.status(200).json({
           status: "success",
           message: "No user found for provided aadhaarNumber",
+          searchAadhaarDigits: aadhaarDigits,
+          matchedApplicants: [],
           pagination: {
             page,
             limit,
@@ -126,10 +148,13 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
           count: 0,
         });
       }
-      const applicantIds = [];
-      if (searchedUser) applicantIds.push(searchedUser._id);
-      if (searchedPerson) applicantIds.push(searchedPerson._id);
-      query = { user_id: { $in: applicantIds } };
+
+      // Prefer exact single match for backward-compatible searchedUser field
+      searchedUser =
+        matchedApplicants.find((a) => a.aadhaarNumber === aadhaarDigits) ||
+        (matchedApplicants.length === 1 ? matchedApplicants[0] : null);
+
+      query = { user_id: { $in: matchedApplicants.map((a) => a._id) } };
     } else {
       // Without Aadhaar: default queue = CSC pending + approved.
       // status query overrides includeApproved/default behavior.
@@ -159,6 +184,9 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
 
     const [applications, total] = await Promise.all([
       Application.find(query)
+        .select(
+          "user_id applicant_ref_model scheme_id date_applied verification_level status verification_history"
+        )
         .populate(
           populateApplicantWithHousehold(
             "aadhaarNumber demographics.fullName demographics.gender contact.mobile.value contact.email.value status.verificationStatus householdId"
@@ -174,10 +202,42 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
     const list = applications.map((app) => {
       const needsCscBioAuth = isCscBioAuthRequired(app);
       const verifiedOrCompleted = isVerifiedOrCompleted(app);
+      const aadhaarNumber = app.user_id?.aadhaarNumber || null;
+      const history = Array.isArray(app.verification_history) ? app.verification_history : [];
+
+      // Only CSC Admin (role level 5) verify/reject events on THIS application
+      const cscVerifications = history
+        .filter(
+          (h) =>
+            Number(h.verified_by_role_level) === 5 &&
+            (h.action === "Verified" || h.action === "Rejected")
+        )
+        .map((h) => ({
+          verified_at: h.verified_at || null,
+          action: h.action,
+          remarks: h.remarks || null,
+          verified_by_name: h.verified_by_name || null,
+          stage: h.stage || null,
+        }));
+
+      const wasRequeued = history.some((h) =>
+        String(h.remarks || "")
+          .toLowerCase()
+          .includes("re-bioauthentication")
+      );
+
+      // fresh = first CSC cycle; re_bio = sent back; no_csc_history = approved/seeded with no CSC log
+      let bioauthReason = "fresh_application";
+      if (wasRequeued) bioauthReason = "re_bioauthentication";
+      else if (!cscVerifications.length && !needsCscBioAuth && app.status !== "Bioauthentication") {
+        bioauthReason = "no_csc_history";
+      }
+
       return {
         _id: app._id,
         applicantName: app.user_id?.demographics?.fullName || "Unknown",
-        applicantAadhaarNumber: app.user_id?.aadhaarNumber || null,
+        aadhaarNumber,
+        applicantAadhaarNumber: aadhaarNumber,
         applicantMobile:
           app.user_id?.contact?.mobile?.value ||
           app.user_id?.householdId?.contact?.mobile?.value ||
@@ -190,6 +250,13 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
         needsCscBioAuth,
         verifiedOrCompleted,
         status: app.status,
+        // Latest CSC verify date for this application only (null if CSC never verified it)
+        cscVerifiedAt: cscVerifications.length
+          ? cscVerifications[cscVerifications.length - 1].verified_at
+          : null,
+        // All CSC verify dates (first apply + each re-bio completion)
+        cscVerifications,
+        bioauthReason,
       };
     });
 
@@ -199,21 +266,11 @@ router.get("/pending-applications", adminAuth, requireCscAdmin, async (req, res)
 
     return res.status(200).json({
       status: "success",
-      ...(searchedUser || searchedPerson
+      ...(aadhaarDigits
         ? {
-            searchedUser: searchedUser
-              ? {
-                  _id: searchedUser._id,
-                  aadhaarNumber: searchedUser.aadhaarNumber || aadhaarNumber,
-                  fullName: searchedUser.demographics?.fullName || null,
-                  source: "PublicUser",
-                }
-              : {
-                  _id: searchedPerson._id,
-                  aadhaarNumber: searchedPerson.aadhaarNumber || aadhaarNumber,
-                  fullName: searchedPerson.demographics?.fullName || null,
-                  source: "BeneficiaryPerson",
-                },
+            searchAadhaarDigits: aadhaarDigits,
+            matchedApplicants,
+            ...(searchedUser ? { searchedUser } : {}),
           }
         : {}),
       pagination: {
@@ -256,12 +313,13 @@ router.get("/pending-public-users", adminAuth, requireCscAdmin, async (req, res)
   try {
     const users = await PublicUser.find({ "status.verificationStatus": "pending" })
       .select(
-        "_id demographics.fullName demographics.gender demographics.dob contact.mobile.value contact.email.value address status.verificationStatus kycLevel audit.createdAt"
+        "_id aadhaarNumber demographics.fullName demographics.gender demographics.dob contact.mobile.value contact.email.value address status.verificationStatus kycLevel audit.createdAt"
       )
       .sort({ "audit.createdAt": -1 });
 
     const list = users.map((u) => ({
       _id: u._id,
+      aadhaarNumber: u.aadhaarNumber || null,
       fullName: u.demographics?.fullName || null,
       gender: u.demographics?.gender || null,
       dob: u.demographics?.dob?.date || null,
